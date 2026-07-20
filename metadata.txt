@@ -1,1 +1,8 @@
-
+name=CartographicMultiRouteLayout
+version=8.2
+license=MIT
+author=CMRL
+description=QGIS Python engine for cartographic multi-route layout with automatic lane generation and manual edit output.
+entry_script=CartographicMultiRouteLayout_v8_1.py
+type=QGIS processing script
+language=Python
