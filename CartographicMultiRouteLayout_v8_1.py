@@ -76,9 +76,7 @@ def debug(*args, feedback=None):
 #
 # Parametergrupper:
 # - InputOutputParameters: output names and QGIS project metadata / outputnavne og QGIS-projektmetadata
-# - CartographyParameters: physical distance/width on print / fysisk afstand/bredde på print
-# - MappingParameters: mapping from original route to lane reference / mapping fra originalrute til lane-reference
-# - PreferredOrderParameters: stable lane order / stabil lane-rækkefølge
+# - CartographyParameters: physical distance/width on print, plus centerline/offset smoothing / fysisk afstand/bredde på print, samt centerlinje-/offset-udjævning
 # - CorridorParameters: corridor detection and stabilization / corridor-detektion og stabilisering
 # - StyleParameters: fixed route palette / fast rutepalette
 #
@@ -105,27 +103,16 @@ class CartographyParameters:
     # Produktionsskala for materialiseret manual-lag.
     manual_target_scale: float = 20000.0
 
+    # Vindue (map units) for arc-længde-udjævning af en corridors
+    # centerlinje, før noget lane overhovedet offsettes fra den. 0
+    # deaktiverer det. Se moving_average_smooth_points().
+    centerline_smoothing_window: float = 120.0
 
-@dataclass(frozen=True)
-class MappingParameters:
-    # Minimumssøgeafstand. Den effektive afstand er scale-aware og kan blive større.
-    manual_lane_search_distance: float = 45.0
-
-    # Straf for unaturlige hop mellem lane-referencer ved junctions.
-    manual_continuity_weight: float = 2.0
-
-    # Straf for ændring af lane-position.
-    manual_lane_inertia_weight: float = 3.0
-
-    # Fade ind/ud mellem fysisk corridor-lane og fri originalgeometri.
-    manual_terminal_transition_distance: float = 200.0
-
-
-@dataclass(frozen=True)
-class PreferredOrderParameters:
-    junction_distance: float = 100.0
-    min_shared_routes: int = 2
-    passes: int = 12
+    # Vindue (map units) for at udtone offset-værdien der hvor en rute
+    # skifter lane_index (fri strækning <-> corridor, eller mellem to
+    # corridorer). 0 deaktiverer det (hårdt spring). Se
+    # smooth_offset_transitions().
+    offset_transition_taper_distance: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -154,13 +141,13 @@ class CorridorParameters:
     # Maksimal reel afstand mellem en rutes optagne start- og slutpunkt,
     # der stadig behandles som én sammenhængende lukning. Bruges både til
     # at samle en løkkes corridor-buer på tværs af start/slut-sømmen og
-    # til at afgøre om ruten selv skal lukkes i manual-materialiseringen.
+    # til at afgøre om ruten selv skal lukkes i materialize_route_layers.
     # Samme tolerance begge steder undgår at de to trin er uenige om
     # hvorvidt en rute er lukket. / Maximum real-world gap between a
     # route's recorded start and end point that is still treated as one
     # continuous closure. Used both to merge a loop's corridor arcs across
     # its start/end seam and to decide whether the route itself should be
-    # closed during manual materialization, so the two steps can't disagree
+    # closed in materialize_route_layers, so the two steps can't disagree
     # about whether a route is closed.
     loop_closure_tolerance: float = 5.0
 
@@ -193,8 +180,6 @@ class StyleParameters:
 class EngineParameters:
     io: InputOutputParameters = field(default_factory=InputOutputParameters)
     cartography: CartographyParameters = field(default_factory=CartographyParameters)
-    mapping: MappingParameters = field(default_factory=MappingParameters)
-    preferred_order: PreferredOrderParameters = field(default_factory=PreferredOrderParameters)
     corridor: CorridorParameters = field(default_factory=CorridorParameters)
     style: StyleParameters = field(default_factory=StyleParameters)
 
@@ -205,9 +190,6 @@ class EngineParameters:
             ("output_lane_spacing_mm", self.cartography.output_lane_spacing_mm),
             ("lane_width_mm", self.cartography.lane_width_mm),
             ("manual_target_scale", self.cartography.manual_target_scale),
-            ("manual_lane_search_distance", self.mapping.manual_lane_search_distance),
-            ("manual_terminal_transition_distance", self.mapping.manual_terminal_transition_distance),
-            ("junction_distance", self.preferred_order.junction_distance),
             ("equivalence_distance", self.corridor.equivalence_distance),
             ("sample_distance", self.corridor.sample_distance),
             ("match_distance", self.corridor.match_distance),
@@ -220,17 +202,11 @@ class EngineParameters:
             if value <= 0:
                 errors.append("{} skal være > 0".format(name))
 
-        if self.mapping.manual_continuity_weight < 0:
-            errors.append("manual_continuity_weight skal være >= 0")
+        if self.cartography.centerline_smoothing_window < 0:
+            errors.append("centerline_smoothing_window skal være >= 0")
 
-        if self.mapping.manual_lane_inertia_weight < 0:
-            errors.append("manual_lane_inertia_weight skal være >= 0")
-
-        if self.preferred_order.min_shared_routes < 2:
-            errors.append("min_shared_routes skal være >= 2")
-
-        if self.preferred_order.passes < 1:
-            errors.append("preferred_order passes skal være >= 1")
+        if self.cartography.offset_transition_taper_distance < 0:
+            errors.append("offset_transition_taper_distance skal være >= 0")
 
         if not 0 < self.corridor.equivalence_min_coverage <= 1:
             errors.append("equivalence_min_coverage skal være > 0 og <= 1")
@@ -275,11 +251,9 @@ def _bind_engine_parameters(parameters):
 
     global GROUP_NAME, CORRIDOR_RESULT_NAME, RESULT_NAME, MANUAL_RESULT_NAME
     global OUTPUT_LANE_SPACING_MM
-    global LANE_WIDTH_MM, MANUAL_TARGET_SCALE
-    global MANUAL_LANE_SEARCH_DISTANCE, MANUAL_CONTINUITY_WEIGHT
-    global MANUAL_LANE_INERTIA_WEIGHT, MANUAL_TERMINAL_TRANSITION_DISTANCE
-    global PREFERRED_ORDER_JUNCTION_DISTANCE, PREFERRED_ORDER_MIN_SHARED_ROUTES
-    global PREFERRED_ORDER_PASSES, CORRIDOR_EQUIVALENCE_DISTANCE
+    global LANE_WIDTH_MM, MANUAL_TARGET_SCALE, CENTERLINE_SMOOTHING_WINDOW
+    global OFFSET_TRANSITION_TAPER_DISTANCE
+    global CORRIDOR_EQUIVALENCE_DISTANCE
     global CORRIDOR_EQUIVALENCE_MIN_COVERAGE, ROUTE_COLORS
     global SAMPLE_DISTANCE, MATCH_DISTANCE, ANGLE_TOLERANCE
     global MIN_STABLE_LENGTH, STABILITY_PASSES, MIN_CORRIDOR_LENGTH
@@ -294,15 +268,8 @@ def _bind_engine_parameters(parameters):
     OUTPUT_LANE_SPACING_MM = parameters.cartography.output_lane_spacing_mm
     LANE_WIDTH_MM = parameters.cartography.lane_width_mm
     MANUAL_TARGET_SCALE = parameters.cartography.manual_target_scale
-
-    MANUAL_LANE_SEARCH_DISTANCE = parameters.mapping.manual_lane_search_distance
-    MANUAL_CONTINUITY_WEIGHT = parameters.mapping.manual_continuity_weight
-    MANUAL_LANE_INERTIA_WEIGHT = parameters.mapping.manual_lane_inertia_weight
-    MANUAL_TERMINAL_TRANSITION_DISTANCE = parameters.mapping.manual_terminal_transition_distance
-
-    PREFERRED_ORDER_JUNCTION_DISTANCE = parameters.preferred_order.junction_distance
-    PREFERRED_ORDER_MIN_SHARED_ROUTES = parameters.preferred_order.min_shared_routes
-    PREFERRED_ORDER_PASSES = parameters.preferred_order.passes
+    CENTERLINE_SMOOTHING_WINDOW = parameters.cartography.centerline_smoothing_window
+    OFFSET_TRANSITION_TAPER_DISTANCE = parameters.cartography.offset_transition_taper_distance
 
     CORRIDOR_EQUIVALENCE_DISTANCE = parameters.corridor.equivalence_distance
     CORRIDOR_EQUIVALENCE_MIN_COVERAGE = parameters.corridor.equivalence_min_coverage
@@ -696,6 +663,17 @@ def corridor_geometry(
 
 
 def offset_polyline_points(points, offset_distance):
+    # Constant-offset convenience wrapper - see
+    # offset_polyline_points_varying() for the actual implementation and
+    # its rationale (avoiding GEOS' offsetCurve() self-intersection).
+
+    return offset_polyline_points_varying(
+        points,
+        [offset_distance] * len(points)
+    )
+
+
+def offset_polyline_points_varying(points, offset_distances):
     # ==================================================
     # PER-VERTEX PERPENDICULAR OFFSET / PUNKTVIS VINKELRET OFFSET
     #
@@ -712,10 +690,14 @@ def offset_polyline_points(points, offset_distance):
     # each end - can't produce that kind of loop. A genuinely sharp bend
     # can still pinch the offset line close to itself, but that's a mild,
     # local degradation instead of a spike.
+    #
+    # offset_distances is one value per point rather than a single
+    # constant, since a route built as one continuous path (see
+    # assemble_route_path()) can change lane_index mid-path wherever it
+    # moves between corridors with a different number of routes -
+    # smooth_offset_transitions() is what makes that change gradual
+    # rather than an abrupt step.
     # ==================================================
-
-    if abs(offset_distance) < 0.000001:
-        return list(points)
 
     point_count = len(points)
 
@@ -757,6 +739,8 @@ def offset_polyline_points(points, offset_distance):
             else:
                 nx, ny = sx / norm, sy / norm
 
+        offset_distance = offset_distances[index]
+
         offset_points.append(
             QgsPointXY(
                 points[index].x() + nx * offset_distance,
@@ -765,6 +749,156 @@ def offset_polyline_points(points, offset_distance):
         )
 
     return offset_points
+
+
+def moving_average_smooth_points(points, window_distance):
+    # ==================================================
+    # ARC-LÆNGDE-UDJÆVNING / ARC-LENGTH MOVING AVERAGE
+    #
+    # A corridor centerline is a literal, unmodified copy of one route's
+    # own recorded GPS points - real-world/receiver jitter that's
+    # invisible at zero offset becomes visibly amplified once any lane is
+    # offset perpendicular to it. This is cartographic noise, not shape:
+    # it needs removing at the source, once, before it ever becomes an
+    # input to offsetting - not smoothed away downstream on every
+    # resulting lane independently.
+    #
+    # A weighted moving average along arc length was chosen over Chaikin
+    # corner-cutting: Chaikin converges to a curve that stays close to
+    # the *original* noisy control points (it rounds corners, it doesn't
+    # damp point-to-point positional noise - tested directly, repeated
+    # iterations plateaued at under 30% noise reduction while exploding
+    # point count). A true moving average damps noise amplitude
+    # predictably with window size, the way any low-pass filter does.
+    # Triangular weighting (full weight at the centre, fading to zero at
+    # the window edge) avoids the abrupt in/out-of-window jump a plain
+    # box average would have at every step.
+    #
+    # Implemented directly in Python rather than via QGIS's own smooth()
+    # so its exact behaviour is fully known and testable - the same
+    # reasoning that replaced GEOS' offsetCurve() with
+    # offset_polyline_points() above, and the same reasoning that made
+    # the earlier simplify()-based attempt this session hard to predict.
+    #
+    # Endpoints are kept exactly fixed (not smoothed): later steps need
+    # to trust that a corridor's start/end point precisely matches where
+    # route-to-corridor matching found it.
+    # ==================================================
+
+    point_count = len(points)
+
+    if point_count < 3 or window_distance <= 0:
+        return list(points)
+
+    distances = cumulative_distances(points)
+    half_window = window_distance / 2.0
+
+    smoothed = [QgsPointXY(points[0])]
+
+    low_index = 0
+    high_index = 0
+
+    for index in range(1, point_count - 1):
+
+        center_distance = distances[index]
+
+        while distances[low_index] < center_distance - half_window:
+            low_index += 1
+
+        if high_index < low_index:
+            high_index = low_index
+
+        while (
+            high_index < point_count - 1
+            and distances[high_index + 1] <= center_distance + half_window
+        ):
+            high_index += 1
+
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_weight = 0.0
+
+        for sample_index in range(low_index, high_index + 1):
+
+            offset = abs(distances[sample_index] - center_distance)
+            weight = max(0.0, 1.0 - offset / half_window)
+
+            sum_x += points[sample_index].x() * weight
+            sum_y += points[sample_index].y() * weight
+            sum_weight += weight
+
+        if sum_weight > 0.0:
+            smoothed.append(
+                QgsPointXY(sum_x / sum_weight, sum_y / sum_weight)
+            )
+        else:
+            smoothed.append(QgsPointXY(points[index]))
+
+    smoothed.append(QgsPointXY(points[-1]))
+
+    return smoothed
+
+
+def smooth_offset_transitions(distances, offset_values, taper_distance):
+    # ==================================================
+    # UDTONING AF OFFSET-OVERGANGE / SMOOTH OFFSET TRANSITIONS
+    #
+    # assemble_route_path() gives each point a target offset with a hard
+    # step wherever the route crosses from one corridor (or a free
+    # stretch) into another with a different lane_index. Applying that
+    # directly would kink the line exactly at each such crossing. This
+    # runs the exact same arc-length weighted-average technique as
+    # moving_average_smooth_points() - just over the 1-D offset value at
+    # each point instead of its 2-D position - so a step becomes a
+    # gradual ramp. Multiple transitions close together blend together
+    # naturally through the same windowing, with no special-casing
+    # needed for that case versus a single isolated transition.
+    # ==================================================
+
+    count = len(offset_values)
+
+    if count < 3 or taper_distance <= 0:
+        return list(offset_values)
+
+    half_window = taper_distance / 2.0
+
+    smoothed = []
+    low_index = 0
+    high_index = 0
+
+    for index in range(count):
+
+        center_distance = distances[index]
+
+        while distances[low_index] < center_distance - half_window:
+            low_index += 1
+
+        if high_index < low_index:
+            high_index = low_index
+
+        while (
+            high_index < count - 1
+            and distances[high_index + 1] <= center_distance + half_window
+        ):
+            high_index += 1
+
+        sum_value = 0.0
+        sum_weight = 0.0
+
+        for sample_index in range(low_index, high_index + 1):
+
+            offset = abs(distances[sample_index] - center_distance)
+            weight = max(0.0, 1.0 - offset / half_window)
+
+            sum_value += offset_values[sample_index] * weight
+            sum_weight += weight
+
+        if sum_weight > 0.0:
+            smoothed.append(sum_value / sum_weight)
+        else:
+            smoothed.append(offset_values[index])
+
+    return smoothed
 
 
 
@@ -1185,7 +1319,7 @@ def merge_corridors(corridors):
     # støj ved en løkkes start/slut-søm), ikke kun floating point-støj.
     # LOOP_CLOSURE_TOLERANCE styrer hvor stort det gab må være, og er
     # den samme tolerance som afgør om en rute regnes som lukket i
-    # materialize_manual_routes, så de to trin ikke er uenige.
+    # materialize_route_layers, så de to trin ikke er uenige.
     # ==================================================
 
     debug("")
@@ -1628,86 +1762,352 @@ def resolve_corridor_equivalence(merged_corridors):
     return canonical_corridor_by_index
 
 
-def resolve_preferred_order(merged_corridors):
+def smooth_corridor_centerlines(merged_corridors):
     # ==================================================
-    # V7.4.3 PREFERRED PAIRWISE ORDER
-    # ==================================================
-    # lane_index er allerede deterministisk inden for en corridor, men
-    # offsetCurve fortolker fortegnet relativt til corridorens retning.
-    # Hvis to tilstødende corridorer har modsat centerline-retning, kan
-    # samme lane-order derfor fysisk spejlvendes og ruterne krydse.
+    # UDJÆVN CORRIDOR-CENTERLINJER / SMOOTH CORRIDOR CENTERLINES
     #
-    # Her behandles hver corridor som en binær orientering: normal/reversed.
-    # For hvert junction med mindst to fælles ruter måles forbindelsesprisen
-    # mellem de fælles lane-endepunkter. Den orienteringskombination som
-    # bedst bevarer den etablerede relative orden får lavest pris.
-    # Et lille globalt relaxationsloop vælger corridor-orienteringer, så
-    # pairwise preferred order genbruges gennem hele corridor-nettet.
+    # Every lane offset from a corridor shares this one geometry, so
+    # smoothing it once here - removing sub-cartographic GPS/receiver
+    # noise before any lane is ever derived from it - replaces smoothing
+    # (or patching around) that noise independently on every lane
+    # downstream.
+    # ==================================================
+
+    if CENTERLINE_SMOOTHING_WINDOW <= 0:
+        return merged_corridors
+
+    for corridor in merged_corridors:
+
+        parts = extract_lines(corridor["geometry"])
+
+        if not parts or len(parts[0]) < 3:
+            continue
+
+        smoothed_points = moving_average_smooth_points(
+            parts[0],
+            CENTERLINE_SMOOTHING_WINDOW
+        )
+
+        corridor["geometry"] = QgsGeometry.fromPolylineXY(
+            smoothed_points
+        )
+
+    return merged_corridors
 
 
-    def oriented_corridor_points(corridor_index, reversed_flag):
-        points = extract_lines(
-            merged_corridors[corridor_index]["geometry"]
-        )[0]
+def nearest_position_on_polyline(point, polyline_points, polyline_distances):
+    # ==================================================
+    # NÆRMESTE POSITION PÅ POLYLINJE / NEAREST POSITION ON POLYLINE
+    #
+    # For a query point, finds the closest point on a reference polyline
+    # and returns it as an arc-length position along that polyline (plus
+    # the projected XY point and the distance), rather than just a vertex
+    # index - needed to locate exactly where a route enters/exits a
+    # corridor even when that's partway along a segment, not at a vertex.
+    # ==================================================
 
-        points = [QgsPointXY(point) for point in points]
+    best_distance = None
+    best_position = None
+    best_point = None
 
-        if reversed_flag:
-            points.reverse()
+    for index in range(len(polyline_points) - 1):
 
-        return points
+        a = polyline_points[index]
+        b = polyline_points[index + 1]
+
+        dx = b.x() - a.x()
+        dy = b.y() - a.y()
+        segment_length_squared = dx * dx + dy * dy
+
+        if segment_length_squared < 0.000001:
+            t = 0.0
+        else:
+            t = (
+                (point.x() - a.x()) * dx
+                + (point.y() - a.y()) * dy
+            ) / segment_length_squared
+            t = max(0.0, min(1.0, t))
+
+        projected_x = a.x() + t * dx
+        projected_y = a.y() + t * dy
+
+        distance = math.hypot(
+            point.x() - projected_x,
+            point.y() - projected_y
+        )
+
+        if best_distance is None or distance < best_distance:
+            segment_length = math.hypot(dx, dy)
+            best_distance = distance
+            best_position = polyline_distances[index] + t * segment_length
+            best_point = QgsPointXY(projected_x, projected_y)
+
+    return best_position, best_point, best_distance
 
 
-    def lane_position_for_route(route_numbers, route_no):
-        lane_center = (len(route_numbers) - 1) / 2.0
-        return route_numbers.index(route_no) - lane_center
+def extract_polyline_subrange(points, distances, position_a, position_b):
+    # ==================================================
+    # UDTRÆK DELSTRÆKNING / EXTRACT POLYLINE SUB-RANGE
+    #
+    # Returns the portion of a polyline between two arc-length positions,
+    # oriented so the result starts at position_a and ends at position_b
+    # (reversed if position_a is further along than position_b) - a route
+    # that only travels part of a shared corridor, and possibly in the
+    # opposite direction to how the corridor itself is oriented, still
+    # gets exactly its own stretch, correctly facing its own travel
+    # direction.
+    # ==================================================
+
+    low = min(position_a, position_b)
+    high = max(position_a, position_b)
+
+    sub_points = [interpolate_point(points, distances, low)]
+
+    for index, distance in enumerate(distances):
+        if low < distance < high:
+            sub_points.append(QgsPointXY(points[index]))
+
+    sub_points.append(interpolate_point(points, distances, high))
+
+    deduplicated = [sub_points[0]]
+
+    for point in sub_points[1:]:
+        if point_distance(deduplicated[-1], point) > 0.001:
+            deduplicated.append(point)
+
+    if position_a > position_b:
+        deduplicated.reverse()
+
+    return deduplicated
 
 
-    def physical_lane_endpoint(
-        corridor_index,
-        reversed_flag,
-        endpoint_index,
-        route_no
-    ):
-        points = oriented_corridor_points(
+def build_corridor_route_index(merged_corridors, canonical_corridor_by_index):
+    # ==================================================
+    # CORRIDOR-OPSLAG / CORRIDOR LOOKUP
+    #
+    # Precomputes, once, what match_run_to_corridor() needs to look
+    # candidates up cheaply per route run: corridors grouped by their
+    # exact route-set (a run can only match a corridor with the identical
+    # set of routes), and each corridor's own points/arc-length distances
+    # computed once rather than on every query. Only canonical corridors
+    # (per resolve_corridor_equivalence) are indexed, so every route
+    # sharing a corridor is matched to the same single geometry even if
+    # that physical stretch was independently detected more than once.
+    # ==================================================
+
+    corridors_by_routes = {}
+    corridor_cache = {}
+
+    for corridor_index, corridor in enumerate(merged_corridors):
+
+        canonical_index = canonical_corridor_by_index.get(
             corridor_index,
-            reversed_flag
+            corridor_index
         )
 
-        if len(points) < 2:
-            return points[0]
+        if canonical_index != corridor_index:
+            continue
 
-        if endpoint_index == 0:
-            anchor = points[0]
-            neighbour = points[1]
-        else:
-            anchor = points[-1]
-            neighbour = points[-2]
+        parts = extract_lines(corridor["geometry"])
 
-        # Tangent skal altid pege i den orienterede centerlines retning.
-        if endpoint_index == 0:
-            dx = neighbour.x() - anchor.x()
-            dy = neighbour.y() - anchor.y()
-        else:
-            dx = anchor.x() - neighbour.x()
-            dy = anchor.y() - neighbour.y()
+        if not parts or len(parts[0]) < 2:
+            continue
 
-        tangent_length = math.hypot(dx, dy)
+        points = [QgsPointXY(point) for point in parts[0]]
+        distances = cumulative_distances(points)
 
-        if tangent_length < 0.000001:
-            return QgsPointXY(anchor)
+        corridor_cache[corridor_index] = {
+            "points": points,
+            "distances": distances,
+        }
 
-        nx = -dy / tangent_length
-        ny = dx / tangent_length
+        corridors_by_routes.setdefault(
+            corridor["routes"],
+            []
+        ).append(corridor_index)
 
-        route_numbers = sorted(
-            merged_corridors[corridor_index]["routes"]
+    return {
+        "merged_corridors": merged_corridors,
+        "corridors_by_routes": corridors_by_routes,
+        "corridor_cache": corridor_cache,
+    }
+
+
+def match_run_to_corridor(corridor_index_data, routes_key, run_start, run_end):
+    # ==================================================
+    # MATCH RUTE-RUN TIL CORRIDOR / MATCH ROUTE RUN TO CORRIDOR
+    #
+    # Given a route's own run (its start/end points, and the route-set it
+    # was classified as belonging to), finds the single canonical
+    # corridor representing that route-set at this physical location -
+    # disambiguating between multiple corridors that happen to share the
+    # exact same route-set elsewhere in the network by picking whichever
+    # is spatially closest to this run - and returns just the sub-range
+    # of that corridor's geometry this run actually covers, oriented to
+    # match this run's own travel direction.
+    # ==================================================
+
+    candidates = corridor_index_data["corridors_by_routes"].get(
+        routes_key,
+        []
+    )
+
+    if not candidates:
+        return None
+
+    corridor_cache = corridor_index_data["corridor_cache"]
+
+    best_corridor_index = None
+    best_score = None
+    best_start_position = None
+    best_end_position = None
+
+    for corridor_index in candidates:
+
+        cached = corridor_cache.get(corridor_index)
+
+        if cached is None:
+            continue
+
+        start_position, start_point, start_distance = (
+            nearest_position_on_polyline(
+                run_start,
+                cached["points"],
+                cached["distances"]
+            )
+        )
+        end_position, end_point, end_distance = (
+            nearest_position_on_polyline(
+                run_end,
+                cached["points"],
+                cached["distances"]
+            )
         )
 
-        lane_index = lane_position_for_route(
-            route_numbers,
-            route_no
-        )
+        if start_position is None or end_position is None:
+            continue
+
+        # A route-set with no genuinely corresponding corridor nearby
+        # (e.g. one filtered out earlier for being too short) must not
+        # get matched to whatever same-route-set corridor happens to be
+        # nearest, however far away - that would silently offset this
+        # run from an unrelated physical location. MATCH_DISTANCE is
+        # already the established "is this really the same feature"
+        # bound used for cross-route matching in classify_route_sets.
+        if start_distance > MATCH_DISTANCE or end_distance > MATCH_DISTANCE:
+            continue
+
+        score = start_distance + end_distance
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best_corridor_index = corridor_index
+            best_start_position = start_position
+            best_end_position = end_position
+
+    if best_corridor_index is None:
+        return None
+
+    cached = corridor_cache[best_corridor_index]
+
+    sub_range_points = extract_polyline_subrange(
+        cached["points"],
+        cached["distances"],
+        best_start_position,
+        best_end_position
+    )
+
+    if len(sub_range_points) < 2:
+        return None
+
+    route_numbers = sorted(
+        corridor_index_data["merged_corridors"][best_corridor_index]["routes"]
+    )
+
+    return {
+        "corridor_index": best_corridor_index,
+        "points": sub_range_points,
+        "route_numbers": route_numbers,
+    }
+
+
+def assemble_route_path(classified_line, corridor_index_data):
+    # ==================================================
+    # SAMMENSÆT RUTE-STRÆKNING FRA TOPOLOGI / ASSEMBLE ROUTE PATH FROM TOPOLOGY
+    #
+    # classify_route_sets() already walks this route's own points in
+    # travel order and splits them into stable runs, each with a known
+    # route-set - exactly the "which part of the topology is this route
+    # present on" mapping. This walks that same run sequence once, in
+    # order, and for each run either takes the route's own points
+    # (unshared stretches - lane_index 0, nothing to offset from) or the
+    # matching corridor's own (smoothed, canonical) sub-range plus this
+    # route's lane_index within it (shared stretches). The result is one
+    # continuous point sequence with a parallel per-point target offset
+    # distance - built once, directly from the topology, never searched
+    # for point-by-point afterwards.
+    #
+    # lane_index is used as-is regardless of whether this run travels the
+    # same or the opposite direction along a shared corridor as another
+    # route sharing it (e.g. two named routes sharing an access road as
+    # part of loops that run opposite ways) - no direction-based sign
+    # correction is applied. Verified directly: offset_polyline_points'
+    # normal is a 90-degree rotation of the local tangent, so a reversed
+    # travel direction already negates the normal on its own: the two
+    # effects cancel out and both routes land on the same physical side
+    # without any extra correction. Adding one here would double-flip
+    # and put them on mismatched sides instead - confirmed by test,
+    # not just reasoned about, since intuition first suggested the
+    # opposite here and was wrong.
+    # ==================================================
+
+    route_line = classified_line["line"]
+    route_no = route_line["route_no"]
+    points = route_line["points"]
+    runs = classified_line["runs"]
+
+    assembled_points = []
+    assembled_offsets = []
+
+    for run in runs:
+
+        routes_key = run["value"]
+
+        run_points = points[run["start"]: run["end"] + 2]
+
+        if len(run_points) < 2:
+            continue
+
+        piece_points = None
+        lane_index = 0.0
+
+        if len(routes_key) >= 2:
+
+            match = match_run_to_corridor(
+                corridor_index_data,
+                routes_key,
+                run_points[0],
+                run_points[-1]
+            )
+
+            if match is not None:
+                piece_points = match["points"]
+                route_numbers = match["route_numbers"]
+                lane_center = (len(route_numbers) - 1) / 2.0
+                lane_index = (
+                    route_numbers.index(route_no) - lane_center
+                )
+
+        if piece_points is None:
+            # Either a genuinely unshared stretch, or a shared route-set
+            # whose corridor was never materialized (e.g. filtered out
+            # for being too short) - either way, fall back to this
+            # route's own points, unoffset.
+            piece_points = [QgsPointXY(point) for point in run_points]
+            lane_index = 0.0
+
+        if len(piece_points) < 2:
+            continue
 
         physical_offset = (
             lane_index
@@ -1716,268 +2116,22 @@ def resolve_preferred_order(merged_corridors):
             / 1000.0
         )
 
-        return QgsPointXY(
-            anchor.x() + nx * physical_offset,
-            anchor.y() + ny * physical_offset
-        )
-
-
-    def nearest_endpoint_pair(corridor_a, corridor_b):
-        points_a = oriented_corridor_points(
-            corridor_a,
-            False
-        )
-        points_b = oriented_corridor_points(
-            corridor_b,
-            False
-        )
-
-        endpoint_pairs = [
-            (0, 0, point_distance(points_a[0], points_b[0])),
-            (0, 1, point_distance(points_a[0], points_b[-1])),
-            (1, 0, point_distance(points_a[-1], points_b[0])),
-            (1, 1, point_distance(points_a[-1], points_b[-1]))
-        ]
-
-        return min(
-            endpoint_pairs,
-            key=lambda item: item[2]
-        )
-
-
-    def preferred_order_connection_cost(
-        corridor_a,
-        reversed_a,
-        corridor_b,
-        reversed_b,
-        endpoint_a_original,
-        endpoint_b_original,
-        shared_routes
-    ):
-        endpoint_a = (
-            1 - endpoint_a_original
-            if reversed_a
-            else endpoint_a_original
-        )
-        endpoint_b = (
-            1 - endpoint_b_original
-            if reversed_b
-            else endpoint_b_original
-        )
-
-        total_cost = 0.0
-
-        for route_no in shared_routes:
-            point_a = physical_lane_endpoint(
-                corridor_a,
-                reversed_a,
-                endpoint_a,
-                route_no
-            )
-            point_b = physical_lane_endpoint(
-                corridor_b,
-                reversed_b,
-                endpoint_b,
-                route_no
-            )
-
-            total_cost += point_distance(
-                point_a,
-                point_b
-            )
-
-        return total_cost
-
-
-    preferred_order_edges = []
-
-    for corridor_a in range(len(merged_corridors)):
-        routes_a = set(
-            merged_corridors[corridor_a]["routes"]
-        )
-
-        for corridor_b in range(
-            corridor_a + 1,
-            len(merged_corridors)
+        if (
+            assembled_points
+            and point_distance(assembled_points[-1], piece_points[0]) < 0.001
         ):
-            shared_routes = sorted(
-                routes_a.intersection(
-                    merged_corridors[corridor_b]["routes"]
-                )
-            )
+            # Coincident boundary point: drop the outgoing piece's copy
+            # rather than the incoming one, so the new piece's lane
+            # assignment governs the shared vertex, not the old one's.
+            assembled_points.pop()
+            assembled_offsets.pop()
 
-            if (
-                len(shared_routes)
-                < PREFERRED_ORDER_MIN_SHARED_ROUTES
-            ):
-                continue
-
-            endpoint_a, endpoint_b, junction_distance = (
-                nearest_endpoint_pair(
-                    corridor_a,
-                    corridor_b
-                )
-            )
-
-            if (
-                junction_distance
-                > PREFERRED_ORDER_JUNCTION_DISTANCE
-            ):
-                continue
-
-            preferred_order_edges.append(
-                {
-                    "a": corridor_a,
-                    "b": corridor_b,
-                    "endpoint_a": endpoint_a,
-                    "endpoint_b": endpoint_b,
-                    "shared_routes": shared_routes,
-                    "junction_distance": junction_distance
-                }
-            )
-
-
-    edges_by_corridor = {
-        corridor_index: []
-        for corridor_index in range(len(merged_corridors))
-    }
-
-    for edge in preferred_order_edges:
-        edges_by_corridor[edge["a"]].append(edge)
-        edges_by_corridor[edge["b"]].append(edge)
-
-
-    corridor_reversed = {
-        corridor_index: False
-        for corridor_index in range(len(merged_corridors))
-    }
-
-    # Start i den længste corridor. Dens retning er kun reference; det er
-    # den relative orientering mellem corridorerne som er kartografisk vigtig.
-    if merged_corridors:
-        preferred_order_anchor = max(
-            range(len(merged_corridors)),
-            key=lambda corridor_index: merged_corridors[
-                corridor_index
-            ]["geometry"].length()
-        )
-    else:
-        preferred_order_anchor = None
-
-
-    def corridor_orientation_cost(corridor_index, reversed_flag):
-        total_cost = 0.0
-
-        for edge in edges_by_corridor[corridor_index]:
-            corridor_a = edge["a"]
-            corridor_b = edge["b"]
-
-            reversed_a = (
-                reversed_flag
-                if corridor_a == corridor_index
-                else corridor_reversed[corridor_a]
-            )
-            reversed_b = (
-                reversed_flag
-                if corridor_b == corridor_index
-                else corridor_reversed[corridor_b]
-            )
-
-            total_cost += preferred_order_connection_cost(
-                corridor_a,
-                reversed_a,
-                corridor_b,
-                reversed_b,
-                edge["endpoint_a"],
-                edge["endpoint_b"],
-                edge["shared_routes"]
-            )
-
-        return total_cost
-
-
-    preferred_order_changes = 0
-
-    for preferred_order_pass in range(
-        PREFERRED_ORDER_PASSES
-    ):
-        pass_changes = 0
-
-        corridor_order = sorted(
-            range(len(merged_corridors)),
-            key=lambda corridor_index: (
-                -len(edges_by_corridor[corridor_index]),
-                -merged_corridors[corridor_index]["geometry"].length()
-            )
+        assembled_points.extend(piece_points)
+        assembled_offsets.extend(
+            [physical_offset] * len(piece_points)
         )
 
-        for corridor_index in corridor_order:
-            if corridor_index == preferred_order_anchor:
-                continue
-
-            if not edges_by_corridor[corridor_index]:
-                continue
-
-            normal_cost = corridor_orientation_cost(
-                corridor_index,
-                False
-            )
-            reversed_cost = corridor_orientation_cost(
-                corridor_index,
-                True
-            )
-
-            new_reversed = reversed_cost < normal_cost
-
-            if (
-                new_reversed
-                != corridor_reversed[corridor_index]
-            ):
-                corridor_reversed[corridor_index] = new_reversed
-                pass_changes += 1
-                preferred_order_changes += 1
-
-        if pass_changes == 0:
-            break
-
-
-    preferred_order_reversed_count = 0
-
-    for corridor_index, reversed_flag in corridor_reversed.items():
-        if not reversed_flag:
-            continue
-
-        points = oriented_corridor_points(
-            corridor_index,
-            True
-        )
-
-        if len(points) < 2:
-            continue
-
-        merged_corridors[corridor_index]["geometry"] = (
-            QgsGeometry.fromPolylineXY(points)
-        )
-
-        preferred_order_reversed_count += 1
-
-
-    debug(
-        "Preferred-order junctions:",
-        len(preferred_order_edges)
-    )
-    debug(
-        "Preferred-order orientation changes:",
-        preferred_order_changes
-    )
-    debug(
-        "Preferred-order reversed corridors:",
-        preferred_order_reversed_count
-    )
-
-
-
-    return preferred_order_edges, preferred_order_reversed_count
+    return assembled_points, assembled_offsets
 
 
 def create_output_layers(project, project_crs):
@@ -1997,7 +2151,7 @@ def create_output_layers(project, project_crs):
 
 
     # ==================================================
-    # CORRIDOR-LAG
+    # CORRIDOR-LAG (diagnostisk - viser den udjævnede topologi)
     # ==================================================
 
     corridor_result = QgsVectorLayer(
@@ -2022,578 +2176,27 @@ def create_output_layers(project, project_crs):
 
 
     # ==================================================
-    # LANE-LAG
+    # RUTE-LAG (Automatic Lanes og Route Layout deler nu én
+    # konstruktion - materialize_route_layers() - og dermed samme skema.
     # ==================================================
 
+    route_fields = [
+        QgsField("route_no", QVariant.Int),
+        QgsField("name", QVariant.String),
+        QgsField("part_count", QVariant.Int),
+        QgsField("target_scale", QVariant.Double),
+        QgsField("length_m", QVariant.Double),
+    ]
+
     result = QgsVectorLayer(
-        "LineString?crs=" + project_crs.authid(),
+        "MultiLineString?crs=" + project_crs.authid(),
         RESULT_NAME,
         "memory"
     )
 
     provider = result.dataProvider()
-
-    provider.addAttributes(
-        [
-            QgsField("corridor_id", QVariant.Int),
-            QgsField("routes", QVariant.String),
-            QgsField("route_count", QVariant.Int),
-            QgsField("route_no", QVariant.Int),
-            QgsField("lane_index", QVariant.Double),
-            QgsField("offset_m", QVariant.Double),
-            QgsField("source_route", QVariant.Int),
-            QgsField("length_m", QVariant.Double)
-        ]
-    )
-
+    provider.addAttributes(list(route_fields))
     result.updateFields()
-
-
-
-    return corridor_result, corridor_provider, result, provider
-
-
-def write_corridors_and_lanes(merged_corridors, corridor_result, corridor_provider, result, provider):
-    # ==================================================
-    # SKRIV CORRIDORS + LANES
-    #
-    # Hver lane får sin egen forudberegnede offset-geometri via
-    # offset_polyline_points() - en simpel punktvis offset, ikke GEOS'
-    # buffer-baserede offsetCurve(), som kan folde ind i en selvskærende
-    # løkke ved et skarpt knæk. Fordi lane-positionen (hvilken corridor,
-    # hvilket lane_index) allerede er fastlagt af topologien før dette
-    # kaldes, skal offsettet kun placere hvert punkt sidelæns med en kendt
-    # afstand - ikke løse vilkårlige selvskæringer.
-    #
-    # Uafhængigt beregnede offsets fra nabo-corridorer rammer stadig
-    # generelt ikke samme koordinat i en junction. snap_lane_junctions()
-    # retter det op bagefter ved at sømme delte ruters lane-endepunkter
-    # sammen på tværs af corridorer.
-    # ==================================================
-
-    debug("")
-    debug("WRITING RESULT / SKRIVER RESULTAT")
-    debug("----------------------------------------")
-
-    corridor_features = []
-    lane_features = []
-    lane_feature_corridor_indices = []
-
-    for corridor_index, corridor in enumerate(
-        merged_corridors
-    ):
-
-        corridor_id = corridor_index + 1
-
-        route_numbers = sorted(
-            corridor["routes"]
-        )
-
-        routes_text = ",".join(
-            str(route_no)
-            for route_no in route_numbers
-        )
-
-        geometry = corridor["geometry"]
-        length_m = geometry.length()
-
-        centerline_parts = extract_lines(geometry)
-        centerline_points = (
-            centerline_parts[0] if centerline_parts else []
-        )
-
-        corridor_feature = QgsFeature(
-            corridor_result.fields()
-        )
-
-        corridor_feature["corridor_id"] = corridor_id
-        corridor_feature["routes"] = routes_text
-        corridor_feature["route_count"] = len(
-            route_numbers
-        )
-        corridor_feature["source_route"] = (
-            corridor["source_route"]
-        )
-        corridor_feature["length_m"] = length_m
-        corridor_feature.setGeometry(geometry)
-
-        corridor_features.append(
-            corridor_feature
-        )
-
-        lane_center = (
-            len(route_numbers) - 1
-        ) / 2.0
-
-        for lane_position, route_no in enumerate(
-            route_numbers
-        ):
-
-            lane_index = (
-                lane_position - lane_center
-            )
-
-            physical_offset = (
-                lane_index
-                * MANUAL_TARGET_SCALE
-                * OUTPUT_LANE_SPACING_MM
-                / 1000.0
-            )
-
-            if len(centerline_points) < 2:
-                continue
-
-            lane_points = offset_polyline_points(
-                centerline_points,
-                physical_offset
-            )
-
-            if len(lane_points) < 2:
-                continue
-
-            lane_feature = QgsFeature(
-                result.fields()
-            )
-
-            lane_feature["corridor_id"] = corridor_id
-            lane_feature["routes"] = routes_text
-            lane_feature["route_count"] = len(
-                route_numbers
-            )
-            lane_feature["route_no"] = route_no
-            lane_feature["lane_index"] = lane_index
-            lane_feature["offset_m"] = physical_offset
-            lane_feature["source_route"] = (
-                corridor["source_route"]
-            )
-            lane_feature["length_m"] = length_m
-
-            lane_feature.setGeometry(
-                QgsGeometry.fromPolylineXY(lane_points)
-            )
-
-            lane_features.append(
-                lane_feature
-            )
-
-            lane_feature_corridor_indices.append(
-                corridor_index
-            )
-
-
-    corridor_provider.addFeatures(
-        corridor_features
-    )
-
-    corridor_result.updateExtents()
-
-
-
-    return lane_features, lane_feature_corridor_indices
-
-
-def taper_endpoint_shift(points, endpoint_slot, target_point):
-    # ==================================================
-    # TAPERED ENDPOINT SHIFT / UDTONET ENDEPUNKTSFORSKYDNING
-    #
-    # Moving only the endpoint vertex to a shared junction point leaves
-    # the rest of the lane exactly where it was - so whenever the natural
-    # offset endpoint and the junction point differ by any real distance,
-    # the last segment has to visibly kink to reach it. The correction is
-    # blended back over several points instead, fading out with a
-    # smoothstep so the approach curves gently into the junction rather
-    # than snapping onto it at the last vertex. The taper distance scales
-    # with the size of the correction itself, so a small nudge fades out
-    # quickly and a large one is spread further back.
-    # ==================================================
-
-    original_endpoint = points[endpoint_slot]
-
-    delta_x = target_point.x() - original_endpoint.x()
-    delta_y = target_point.y() - original_endpoint.y()
-
-    if abs(delta_x) < 0.000001 and abs(delta_y) < 0.000001:
-        return points
-
-    delta_magnitude = math.hypot(delta_x, delta_y)
-    taper_distance = max(SAMPLE_DISTANCE * 2.0, delta_magnitude * 3.0)
-
-    point_count = len(points)
-
-    walk_order = (
-        range(point_count)
-        if endpoint_slot == 0
-        else range(point_count - 1, -1, -1)
-    )
-
-    new_points = list(points)
-    cumulative_distance = 0.0
-    previous_point = None
-
-    for index in walk_order:
-
-        current_point = points[index]
-
-        if previous_point is not None:
-            cumulative_distance += point_distance(
-                previous_point,
-                current_point
-            )
-
-        previous_point = current_point
-
-        if cumulative_distance >= taper_distance:
-            break
-
-        weight = 1.0 - cumulative_distance / taper_distance
-        weight = weight * weight * (3.0 - 2.0 * weight)
-
-        new_points[index] = QgsPointXY(
-            current_point.x() + delta_x * weight,
-            current_point.y() + delta_y * weight
-        )
-
-    new_points[endpoint_slot] = QgsPointXY(target_point)
-
-    return new_points
-
-
-def snap_lane_junctions(merged_corridors, lane_features, lane_feature_corridor_indices):
-    # ==================================================
-    # SØM LANE-JUNCTIONS / SNAP LANE JUNCTIONS
-    #
-    # Hver lane har sin egen uafhængigt beregnede offsetCurve, så to
-    # corridorers lane-endepunkter for samme rute rammer generelt ikke
-    # præcis samme koordinat, selvom corridorernes centerlines mødes.
-    #
-    # Ved en simpel to-vejs junction er et parvist sømme-skridt nok, men
-    # hvor tre eller flere corridorer mødes i samme punkt ("hub"), kan
-    # parvis sømning ikke få alle til at konvergere.
-    #
-    # Klyngning løser det - men KUN hvis man klynger på corridorernes egne
-    # centerline-endepunkter, ikke på lanes' offset-positioner. Lane-
-    # offsets kan sprede sig langt fra hinanden (op til flere titals meter
-    # ved mange ruter i samme corridor), så single-linkage klyngning på
-    # dem kan transitivt kæde to i virkeligheden separate junctions sammen
-    # og kollapse en helt tredje corridors lane til ét eneste punkt.
-    # Centerline-endepunkter er langt færre og repræsenterer den faktiske
-    # topologi, så klyngning der er robust.
-    #
-    # Fremgangsmåde:
-    # 1. Klyng corridorernes egne centerline-endepunkter -> junction-huber.
-    # 2. For hver hub: find de ruter der reelt går igennem mindst to af
-    #    hubbens corridorer, og søm netop de ruters lane-endepunkter
-    #    sammen til ét centroid pr. rute pr. hub.
-    # ==================================================
-
-    debug("")
-    debug("SNAPPING LANE JUNCTIONS / SØMMER LANE-JUNCTIONS")
-    debug("----------------------------------------")
-
-    corridor_endpoints = []
-
-    for corridor_index, corridor in enumerate(merged_corridors):
-
-        parts = extract_lines(corridor["geometry"])
-
-        if not parts or len(parts[0]) < 2:
-            continue
-
-        points = parts[0]
-
-        corridor_endpoints.append(
-            (corridor_index, 0, QgsPointXY(points[0]))
-        )
-        corridor_endpoints.append(
-            (corridor_index, -1, QgsPointXY(points[-1]))
-        )
-
-
-    endpoint_count = len(corridor_endpoints)
-    cluster_parent = list(range(endpoint_count))
-
-    # A corridor shorter than PREFERRED_ORDER_JUNCTION_DISTANCE has its own
-    # far end within that distance of its own near end's hub - so a naive
-    # "merge whenever within range" union can pull a short spur's far tip
-    # into the very hub its near end belongs to, corrupting that hub for
-    # every other corridor in it. Candidate merges are therefore processed
-    # closest-first (Kruskal-style), and any merge that would leave a
-    # single corridor with both its ends in the same resulting cluster is
-    # rejected outright, however indirectly it would happen.
-    cluster_corridor_slots = {
-        index: {corridor_endpoints[index][0]: {corridor_endpoints[index][1]}}
-        for index in range(endpoint_count)
-    }
-
-
-    def find_cluster(index):
-
-        while cluster_parent[index] != index:
-            cluster_parent[index] = cluster_parent[cluster_parent[index]]
-            index = cluster_parent[index]
-
-        return index
-
-
-    candidate_merges = []
-
-    for i in range(endpoint_count):
-
-        corridor_i, _, point_i = corridor_endpoints[i]
-
-        for j in range(i + 1, endpoint_count):
-
-            corridor_j, _, point_j = corridor_endpoints[j]
-
-            # A corridor's own two ends can never directly merge.
-            if corridor_i == corridor_j:
-                continue
-
-            distance = point_distance(point_i, point_j)
-
-            if distance <= PREFERRED_ORDER_JUNCTION_DISTANCE:
-                candidate_merges.append((distance, i, j))
-
-
-    candidate_merges.sort(key=lambda merge: merge[0])
-
-    for _, i, j in candidate_merges:
-
-        root_i = find_cluster(i)
-        root_j = find_cluster(j)
-
-        if root_i == root_j:
-            continue
-
-        slots_i = cluster_corridor_slots[root_i]
-        slots_j = cluster_corridor_slots[root_j]
-
-        would_conflict = any(
-            corridor_index in slots_j
-            and (slot_set | slots_j[corridor_index]) == {0, -1}
-            for corridor_index, slot_set in slots_i.items()
-        )
-
-        if would_conflict:
-            continue
-
-        merged_slots = {
-            corridor_index: set(slot_set)
-            for corridor_index, slot_set in slots_i.items()
-        }
-
-        for corridor_index, slot_set in slots_j.items():
-            merged_slots.setdefault(corridor_index, set()).update(slot_set)
-
-        new_root, old_root = sorted((root_i, root_j))
-        cluster_parent[old_root] = new_root
-        cluster_corridor_slots[new_root] = merged_slots
-        del cluster_corridor_slots[old_root]
-
-
-    hubs = {}
-
-    for index in range(endpoint_count):
-        hubs.setdefault(
-            find_cluster(index),
-            []
-        ).append(corridor_endpoints[index])
-
-
-    lane_feature_by_corridor_route = {}
-
-    for lane_feature, corridor_index in zip(
-        lane_features,
-        lane_feature_corridor_indices
-    ):
-        key = (corridor_index, int(lane_feature["route_no"]))
-        lane_feature_by_corridor_route[key] = lane_feature
-
-
-    # A short corridor can legitimately have each of its two ends belong
-    # to a different, genuinely separate hub (e.g. two forks close
-    # together on the real trail network). Snapping both ends independently
-    # is then correct - but if the corridor is short enough, the two
-    # snapped points can end up on top of each other, collapsing the lane
-    # to nothing. Proposals are collected first and only applied once it's
-    # known whether both of a feature's ends are being pulled at once, so
-    # that collapse can be detected and the weaker-supported end skipped.
-    proposed_snaps = {}
-
-    snapped_hub_count = 0
-
-    for hub_members in hubs.values():
-
-        # A hub needs at least two distinct corridors meeting to be a
-        # real junction, not just one corridor's lone endpoint.
-        if len({corridor_index for corridor_index, _, _ in hub_members}) < 2:
-            continue
-
-        routes_at_hub = {}
-
-        for corridor_index, endpoint_slot, _ in hub_members:
-
-            for route_no in merged_corridors[corridor_index]["routes"]:
-
-                lane_feature = lane_feature_by_corridor_route.get(
-                    (corridor_index, route_no)
-                )
-
-                if lane_feature is None:
-                    continue
-
-                routes_at_hub.setdefault(
-                    route_no,
-                    []
-                ).append(
-                    (lane_feature, endpoint_slot)
-                )
-
-        for route_no, members in routes_at_hub.items():
-
-            # Only meaningful if this route actually reaches the hub
-            # through two or more of its corridors.
-            distinct_features = {feature for feature, _ in members}
-
-            if len(distinct_features) < 2:
-                continue
-
-            positions = []
-
-            for lane_feature, endpoint_slot in members:
-
-                parts = extract_lines(lane_feature.geometry())
-
-                if not parts or len(parts[0]) < 2:
-                    continue
-
-                positions.append(
-                    QgsPointXY(parts[0][endpoint_slot])
-                )
-
-            if len(positions) < 2:
-                continue
-
-            centroid = QgsPointXY(
-                sum(point.x() for point in positions) / len(positions),
-                sum(point.y() for point in positions) / len(positions)
-            )
-
-            hub_strength = len(distinct_features)
-
-            for lane_feature, endpoint_slot in members:
-
-                entry = proposed_snaps.setdefault(
-                    id(lane_feature),
-                    {"feature": lane_feature, "slots": {}}
-                )
-
-                entry["slots"][endpoint_slot] = (centroid, hub_strength)
-
-            snapped_hub_count += 1
-
-
-    snapped_point_count = 0
-    collapse_guard_count = 0
-
-    for entry in proposed_snaps.values():
-
-        lane_feature = entry["feature"]
-        slots = entry["slots"]
-
-        parts = extract_lines(lane_feature.geometry())
-
-        if not parts or len(parts[0]) < 2:
-            continue
-
-        original_points = [QgsPointXY(point) for point in parts[0]]
-
-        if len(slots) == 2:
-
-            candidate_points = list(original_points)
-
-            for endpoint_slot, (point, _) in slots.items():
-                candidate_points[endpoint_slot] = point
-
-            new_length = QgsGeometry.fromPolylineXY(
-                candidate_points
-            ).length()
-
-            if new_length < MIN_CORRIDOR_LENGTH:
-
-                # Keep only the snap backed by the stronger (larger) hub;
-                # leave the other end at its original, unsnapped position.
-                slot_start, slot_end = sorted(slots.keys())
-                strength_start = slots[slot_start][1]
-                strength_end = slots[slot_end][1]
-
-                weaker_slot = (
-                    slot_start
-                    if strength_start < strength_end
-                    else slot_end
-                )
-
-                del slots[weaker_slot]
-                collapse_guard_count += 1
-
-        new_points = list(original_points)
-
-        for endpoint_slot, (point, _) in slots.items():
-            new_points = taper_endpoint_shift(
-                new_points,
-                endpoint_slot,
-                point
-            )
-            snapped_point_count += 1
-
-        lane_feature.setGeometry(
-            QgsGeometry.fromPolylineXY(new_points)
-        )
-
-    debug(
-        "Route junctions snapped / Rute-junctions sømmet:",
-        snapped_hub_count
-    )
-    debug(
-        "Lane endpoints snapped / Lane-endepunkter sømmet:",
-        snapped_point_count
-    )
-    debug(
-        "Collapse guard triggered / Kollaps-sikring udløst:",
-        collapse_guard_count
-    )
-
-
-
-    return lane_features
-
-
-def commit_lane_features(provider, result, lane_features):
-
-    provider.addFeatures(lane_features)
-    result.updateExtents()
-
-
-def materialize_manual_routes(project_crs, routes, route_lines, lane_features, lane_feature_corridor_indices, canonical_corridor_by_index):
-    # ==================================================
-    # V7.3 ROUTE-SEQUENCE LANE MATERIALISATION
-    #
-    # V7.2 samlede de materialiserede corridor-lanes direkte.
-    # Det gav dobbelte/overlappende linjer omkring corridor-skift.
-    #
-    # V7.3 gør det omvendt:
-    # 1. materialiser corridor-lanes som interne referencer
-    # 2. gennemløb ORIGINALRUTEN i dens egen sample-rækkefølge
-    # 3. map hvert originalt samplepunkt til nærmeste relevante lane
-    # 4. vægt kontinuitet fra forrige valgte punkt
-    # 5. byg rutegeometrien af den ordnede punktsekvens
-    #
-    # Corridor-lanes er altså referencegeometri, ikke outputdele.
-    # ==================================================
-
-    debug("")
-    debug("MATERIALIZING MANUAL LAYER VIA ROUTE SEQUENCE / MATERIALISERER MANUAL-LAG VIA ROUTE-SEKVENS")
-    debug("----------------------------------------")
 
     manual_result = QgsVectorLayer(
         "MultiLineString?crs=" + project_crs.authid(),
@@ -2602,935 +2205,228 @@ def materialize_manual_routes(project_crs, routes, route_lines, lane_features, l
     )
 
     manual_provider = manual_result.dataProvider()
+    manual_provider.addAttributes(list(route_fields))
+    manual_result.updateFields()
 
-    manual_provider.addAttributes(
-        [
-            QgsField("route_no", QVariant.Int),
-            QgsField("name", QVariant.String),
-            QgsField("part_count", QVariant.Int),
-            QgsField("target_scale", QVariant.Double),
-            QgsField("length_m", QVariant.Double),
-            QgsField("mapped_pts", QVariant.Int),
-            QgsField("fallback_pts", QVariant.Int)
-        ]
+
+
+    return (
+        corridor_result,
+        corridor_provider,
+        result,
+        provider,
+        manual_result,
+        manual_provider,
     )
 
-    manual_result.updateFields()
+
+def write_corridor_diagnostics(merged_corridors, corridor_result, corridor_provider):
+    # ==================================================
+    # SKRIV CORRIDOR-DIAGNOSTIK / WRITE CORRIDOR DIAGNOSTICS
+    #
+    # The "CMRL Corridors" layer is a diagnostic view of the topology
+    # itself (smoothed centerlines, route membership) - no lane offsets
+    # are computed here, since lanes are now built once per route
+    # directly from this same topology (materialize_route_layers()).
+    # ==================================================
+
+    debug("")
+    debug("WRITING CORRIDOR DIAGNOSTICS / SKRIVER CORRIDOR-DIAGNOSTIK")
+    debug("----------------------------------------")
+
+    corridor_features = []
+
+    for corridor_index, corridor in enumerate(merged_corridors):
+
+        corridor_id = corridor_index + 1
+        route_numbers = sorted(corridor["routes"])
+        routes_text = ",".join(str(route_no) for route_no in route_numbers)
+        geometry = corridor["geometry"]
+
+        corridor_feature = QgsFeature(corridor_result.fields())
+
+        corridor_feature["corridor_id"] = corridor_id
+        corridor_feature["routes"] = routes_text
+        corridor_feature["route_count"] = len(route_numbers)
+        corridor_feature["source_route"] = corridor["source_route"]
+        corridor_feature["length_m"] = geometry.length()
+        corridor_feature.setGeometry(geometry)
+
+        corridor_features.append(corridor_feature)
+
+    corridor_provider.addFeatures(corridor_features)
+    corridor_result.updateExtents()
+
+    debug("Corridor features / Corridor-features:", len(corridor_features))
+
+
+
+    return corridor_features
+
+
+def materialize_route_layers(
+    classified_lines,
+    corridor_index_data,
+    routes,
+    result,
+    provider,
+    manual_result,
+    manual_provider
+):
+    # ==================================================
+    # MATERIALISER RUTELAG FRA TOPOLOGI / MATERIALIZE ROUTE LAYERS FROM TOPOLOGY
+    #
+    # One continuous path per route, built directly from the topology
+    # (assemble_route_path), tapered at lane_index changes
+    # (smooth_offset_transitions) and offset once
+    # (offset_polyline_points_varying) - no per-corridor offsetting, no
+    # junction snapping, no point-by-point nearest-reference search
+    # afterwards. Automatic Lanes and Route Layout are populated from the
+    # same geometry: the former is the untouched automatic result, the
+    # latter is the same starting point intended for hand-editing.
+    # ==================================================
+
+    debug("")
+    debug("MATERIALIZING ROUTE LAYERS FROM TOPOLOGY / MATERIALISERER RUTELAG FRA TOPOLOGI")
+    debug("----------------------------------------")
 
     route_name_by_no = {
         route["number"]: route["name"]
         for route in routes
     }
 
+    parts_by_route = {}
+    closed_gap_repairs = 0
 
-    # --------------------------------------------------
-    # BYG FYSISKE LANE-REFERENCER
-    # --------------------------------------------------
+    for classified_line in classified_lines:
 
-    lane_reference_layer = QgsVectorLayer(
-        "LineString?crs=" + project_crs.authid(),
-        "_temporary_lane_reference_index",
-        "memory"
-    )
+        route_no = classified_line["line"]["route_no"]
 
-    lane_reference_provider = (
-        lane_reference_layer.dataProvider()
-    )
-
-    lane_reference_provider.addAttributes(
-        [
-            QgsField("ref_id", QVariant.Int),
-            QgsField("route_no", QVariant.Int),
-            QgsField("corridor_id", QVariant.Int),
-            QgsField("canonical_corridor_id", QVariant.Int),
-            QgsField("physical_lane_id", QVariant.Int),
-        ]
-    )
-
-    lane_reference_layer.updateFields()
-
-    lane_reference_records = {}
-    lane_reference_features = []
-    next_reference_id = 0
-    physical_lane_identity = {}
-    next_physical_lane_id = 0
-
-    skipped_equivalent_lane_references = 0
-
-    for lane_feature, corridor_index in zip(
-        lane_features,
-        lane_feature_corridor_indices
-    ):
-
-        canonical_index = (
-            canonical_corridor_by_index.get(
-                corridor_index,
-                corridor_index
-            )
+        points, offsets = assemble_route_path(
+            classified_line,
+            corridor_index_data
         )
 
-        if corridor_index != canonical_index:
-            skipped_equivalent_lane_references += 1
+        if len(points) < 2:
             continue
 
-        route_no = int(lane_feature["route_no"])
-        lane_index = float(lane_feature["lane_index"])
-        canonical_corridor_id = int(
-            lane_feature["corridor_id"]
-        )
-        physical_lane_key = (
-            canonical_corridor_id,
-            route_no,
-            lane_index
-        )
-        physical_lane_id = physical_lane_identity.get(
-            physical_lane_key
-        )
-        if physical_lane_id is None:
-            physical_lane_id = next_physical_lane_id
-            physical_lane_identity[
-                physical_lane_key
-            ] = physical_lane_id
-            next_physical_lane_id += 1
+        # Corridor-matched stretches already carry smoothed geometry
+        # (smooth_corridor_centerlines), but solo/private stretches are
+        # still each route's own raw recorded points, and the seam where
+        # a route's classified route-set boundary falls slightly before
+        # its physical divergence stabilizes can leave a small kink where
+        # a corridor-matched piece meets a solo piece. One more arc-length
+        # smoothing pass over the fully assembled path - the same
+        # primitive used on corridor centerlines - removes both without
+        # a seam-specific special case.
+        points = moving_average_smooth_points(points, CENTERLINE_SMOOTHING_WINDOW)
 
-        # lane_feature's geometry is already the precomputed, junction-
-        # snapped physical offset curve built in write_corridors_and_lanes
-        # / snap_lane_junctions - no need to offset it again here.
-        lane_geometry = QgsGeometry(
-            lane_feature.geometry()
+        distances = cumulative_distances(points)
+
+        tapered_offsets = smooth_offset_transitions(
+            distances,
+            offsets,
+            OFFSET_TRANSITION_TAPER_DISTANCE
         )
 
-        if (
-            lane_geometry.isNull()
-            or lane_geometry.isEmpty()
-        ):
-            continue
-
-        for points in extract_lines(lane_geometry):
-
-            if len(points) < 2:
-                continue
-
-            geometry = QgsGeometry.fromPolylineXY(
-                points
-            )
-
-            reference_feature = QgsFeature(
-                lane_reference_layer.fields()
-            )
-
-            reference_feature["ref_id"] = next_reference_id
-            reference_feature["route_no"] = route_no
-            reference_feature["corridor_id"] = int(
-                lane_feature["corridor_id"]
-            )
-            reference_feature["canonical_corridor_id"] = canonical_corridor_id
-            reference_feature["physical_lane_id"] = physical_lane_id
-            reference_feature.setGeometry(geometry)
-
-            lane_reference_features.append(
-                reference_feature
-            )
-
-            lane_reference_records[next_reference_id] = {
-                "route_no": route_no,
-                "geometry": geometry,
-                "corridor_id": int(lane_feature["corridor_id"]),
-                "canonical_corridor_id": canonical_corridor_id,
-                "lane_index": lane_index,
-                "physical_lane_id": physical_lane_id
-            }
-
-            next_reference_id += 1
-
-
-    lane_reference_provider.addFeatures(
-        lane_reference_features
-    )
-
-    lane_reference_fid_to_ref_id = {}
-
-    for feature in lane_reference_layer.getFeatures():
-
-        lane_reference_fid_to_ref_id[
-            feature.id()
-        ] = int(feature["ref_id"])
-
-
-    lane_reference_index = QgsSpatialIndex(
-        lane_reference_layer.getFeatures()
-    )
-
-    corridor_routes_by_id = {}
-    corridor_lane_by_route = {}
-
-    for reference in lane_reference_records.values():
-        corridor_routes_by_id.setdefault(
-            reference["corridor_id"],
-            set()
-        ).add(
-            reference["route_no"]
+        final_points = offset_polyline_points_varying(
+            points,
+            tapered_offsets
         )
 
-    for corridor_id, corridor_routes in corridor_routes_by_id.items():
-        corridor_lane_by_route[corridor_id] = {
-            reference["route_no"]: reference["lane_index"]
-            for reference in lane_reference_records.values()
-            if reference["corridor_id"] == corridor_id
-        }
+        # A genuinely closed original route (loop) should still close
+        # after offsetting, but each end may have picked up a different
+        # lane_index taper right at the seam. Close a small residual gap
+        # directly rather than leaving a visible break.
+        original_gap = point_distance(points[0], points[-1])
 
-    for corridor_id, corridor_routes in corridor_routes_by_id.items():
-        debug(
-            "Corridor membership / Korridor medlemskab:",
-            corridor_id,
-            "routes",
-            sorted(corridor_routes),
-            "lane_indexes",
-            {
-                route_no: corridor_lane_by_route[corridor_id].get(route_no)
-                for route_no in sorted(corridor_routes)
-            }
-        )
+        if original_gap < LOOP_CLOSURE_TOLERANCE:
 
-    route_transition_history_by_route = {}
-    route_closed_by_route = {}
+            final_gap = point_distance(final_points[0], final_points[-1])
+
+            if 0 < final_gap < LOOP_CLOSURE_TOLERANCE * 2:
+                final_points[-1] = QgsPointXY(final_points[0])
+                closed_gap_repairs += 1
+
+        parts_by_route.setdefault(route_no, []).append(final_points)
 
     debug(
-        "Physical lane references / Fysiske lane-referencer:",
-        len(lane_reference_records)
+        "Closed-route gaps repaired / Lukkede rutehuller repareret:",
+        closed_gap_repairs
     )
 
-    debug(
-        "Unique physical lanes / Unikke fysiske lanes:",
-        len({
-            reference["physical_lane_id"]
-            for reference in lane_reference_records.values()
-        })
-    )
-
-    debug(
-        "Equivalent lane references skipped / Ækvivalente lane-referencer sprunget over:",
-        skipped_equivalent_lane_references
-    )
-
-
-    # --------------------------------------------------
-    # V7.4.4 SCALE-AWARE SEARCH DISTANCE
-    #
-    # Lane-referencerne ligger fysisk forskudt fra corridor-centerline.
-    # Ved større target scale / lane spacing kan en fast søgeafstand
-    # derfor ikke nå scriptets egne lane-referencer.
-    #
-    # Søgeafstanden skaleres automatisk med den største lane-offset
-    # og får samtidig geometrisk margin til corridor-match/sampling.
-    # --------------------------------------------------
-
-    max_physical_lane_offset = 0.0
-
-    for reference in lane_reference_records.values():
-        lane_index = abs(float(reference["lane_index"]))
-
-        physical_lane_offset = (
-            lane_index
-            * MANUAL_TARGET_SCALE
-            * OUTPUT_LANE_SPACING_MM
-            / 1000.0
-        )
-
-        max_physical_lane_offset = max(
-            max_physical_lane_offset,
-            physical_lane_offset
-        )
-
-
-    EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE = max(
-        MANUAL_LANE_SEARCH_DISTANCE,
-        max_physical_lane_offset
-        + MATCH_DISTANCE
-        + SAMPLE_DISTANCE
-    )
-
-    debug(
-        "Scale-aware lane search distance:",
-        "{:.1f} m".format(
-            EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE
-        )
-    )
-
-
-    # --------------------------------------------------
-    # MAP ORIGINAL RUTE TIL LANE-REFERENCER I RÆKKEFØLGE
-    # --------------------------------------------------
-
-    manual_parts_by_route = {}
-    manual_stats_by_route = {}
-
-    for route_line in route_lines:
-
-        route_no = route_line["route_no"]
-        original_points = route_line["points"]
-        route_closed = (
-            len(original_points) >= 2
-            and point_distance(
-                original_points[0],
-                original_points[-1]
-            )
-            < LOOP_CLOSURE_TOLERANCE
-        )
-
-        route_closed_by_route[route_no] = route_closed
-        debug(
-            "Route closure / Rute lukket:",
-            route_no,
-            "closed" if route_closed else "open"
-        )
-        route_transition_history = []
-
-        mapped_points = []
-        raw_mapped_points = []
-        raw_original_points = []
-        raw_mapping_states = []
-        mapped_count = 0
-        fallback_count = 0
-
-        previous_original = None
-        previous_mapped = None
-        previous_reference_id = None
-
-        for original_point in original_points:
-
-            search_rect = QgsRectangle(
-                original_point.x() - EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE,
-                original_point.y() - EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE,
-                original_point.x() + EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE,
-                original_point.y() + EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE
-            )
-
-            candidate_fids = (
-                lane_reference_index.intersects(
-                    search_rect
-                )
-            )
-
-            best_point = None
-            best_score = None
-            best_reference_id = None
-
-            original_point_geometry = (
-                QgsGeometry.fromPointXY(
-                    original_point
-                )
-            )
-
-            if (
-                previous_original is not None
-                and previous_mapped is not None
-            ):
-                expected_step = point_distance(
-                    previous_original,
-                    original_point
-                )
-            else:
-                expected_step = None
-
-            for candidate_fid in candidate_fids:
-
-                reference_id = (
-                    lane_reference_fid_to_ref_id.get(
-                        candidate_fid
-                    )
-                )
-
-                if reference_id is None:
-                    continue
-
-                reference = lane_reference_records[
-                    reference_id
-                ]
-
-                if reference["route_no"] != route_no:
-                    continue
-
-                reference_geometry = reference["geometry"]
-
-                nearest_geometry = (
-                    reference_geometry.nearestPoint(
-                        original_point_geometry
-                    )
-                )
-
-                if (
-                    nearest_geometry.isNull()
-                    or nearest_geometry.isEmpty()
-                ):
-                    continue
-
-                nearest_point = QgsPointXY(
-                    nearest_geometry.asPoint()
-                )
-
-                source_distance = point_distance(
-                    original_point,
-                    nearest_point
-                )
-
-                if (
-                    source_distance
-                    > EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE
-                ):
-                    continue
-
-                score = source_distance
-
-                if (
-                    expected_step is not None
-                    and previous_mapped is not None
-                ):
-                    mapped_step = point_distance(
-                        previous_mapped,
-                        nearest_point
-                    )
-
-                    continuity_error = abs(
-                        mapped_step - expected_step
-                    )
-
-                    score += (
-                        continuity_error
-                        * MANUAL_CONTINUITY_WEIGHT
-                    )
-
-                # V7.4.1 LANE-ORDER INERTIA
-                # En ny reference må gerne vinde, men et lane-skift
-                # skal være geometrisk begrundet. Straffen måles i
-                # fysisk lane-afstand og virker kun når lane_index
-                # faktisk ændres.
-                if previous_reference_id is not None:
-                    previous_reference = lane_reference_records.get(
-                        previous_reference_id
-                    )
-
-                    if previous_reference is not None:
-                        lane_shift = abs(
-                            reference["lane_index"]
-                            - previous_reference["lane_index"]
-                        )
-
-                        score += (
-                            lane_shift
-                            * MANUAL_TARGET_SCALE
-                            * OUTPUT_LANE_SPACING_MM
-                            / 1000.0
-                            * MANUAL_LANE_INERTIA_WEIGHT
-                        )
-
-                if (
-                    best_score is None
-                    or score < best_score
-                ):
-                    best_score = score
-                    best_point = nearest_point
-                    best_reference_id = reference_id
-
-
-            if best_point is None:
-                chosen_point = QgsPointXY(
-                    original_point
-                )
-                fallback_count += 1
-            else:
-                chosen_point = best_point
-                mapped_count += 1
-
-                best_reference = lane_reference_records.get(
-                    best_reference_id
-                )
-
-                if (
-                    previous_reference_id is not None
-                    and best_reference is not None
-                ):
-                    previous_reference = lane_reference_records.get(
-                        previous_reference_id
-                    )
-
-                    if (
-                        previous_reference is not None
-                        and previous_reference["corridor_id"]
-                        != best_reference["corridor_id"]
-                    ):
-                        prev_corridor = previous_reference["corridor_id"]
-                        curr_corridor = best_reference["corridor_id"]
-                        prev_routes = sorted(
-                            corridor_routes_by_id.get(
-                                prev_corridor,
-                                []
-                            )
-                        )
-                        curr_routes = sorted(
-                            corridor_routes_by_id.get(
-                                curr_corridor,
-                                []
-                            )
-                        )
-
-                        if len(prev_routes) != len(curr_routes):
-                            prev_lane_by_route = corridor_lane_by_route.get(
-                                prev_corridor,
-                                {}
-                            )
-                            curr_lane_by_route = corridor_lane_by_route.get(
-                                curr_corridor,
-                                {}
-                            )
-                            transition = {
-                                "from_corridor": prev_corridor,
-                                "to_corridor": curr_corridor,
-                                "prev_routes": prev_routes,
-                                "curr_routes": curr_routes,
-                                "route_no": route_no,
-                                "prev_lane": previous_reference["lane_index"],
-                                "curr_lane": best_reference["lane_index"],
-                                "prev_route_lane": prev_lane_by_route.get(route_no),
-                                "curr_route_lane": curr_lane_by_route.get(route_no),
-                                "prev_physical_lane": previous_reference["physical_lane_id"],
-                                "curr_physical_lane": best_reference["physical_lane_id"],
-                                "prev_canonical_corridor": previous_reference["canonical_corridor_id"],
-                                "curr_canonical_corridor": best_reference["canonical_corridor_id"],
-                            }
-                            route_transition_history.append(
-                                transition
-                            )
-                            if len(route_transition_history) > 10:
-                                route_transition_history.pop(0)
-
-                            debug(
-                                "Corridor transition for route",
-                                route_no,
-                                ":",
-                                prev_corridor,
-                                "(canonical",
-                                transition["prev_canonical_corridor"],
-                                ")",
-                                "->",
-                                curr_corridor,
-                                "(canonical",
-                                transition["curr_canonical_corridor"],
-                                ")"
-                            )
-                            debug(
-                                "Prev routes:",
-                                ",".join(str(r) for r in prev_routes)
-                            )
-                            debug(
-                                "Curr routes:",
-                                ",".join(str(r) for r in curr_routes)
-                            )
-                            debug(
-                                "Lane index",
-                                previous_reference["lane_index"],
-                                "(physical",
-                                previous_reference["physical_lane_id"],
-                                ")",
-                                "->",
-                                best_reference["lane_index"],
-                                "(physical",
-                                best_reference["physical_lane_id"],
-                                ")"
-                            )
-
-                previous_reference_id = best_reference_id
-
-            raw_original_points.append(
-                QgsPointXY(original_point)
-            )
-            raw_mapped_points.append(
-                QgsPointXY(chosen_point)
-            )
-            raw_mapping_states.append(
-                best_point is not None
-            )
-
-            previous_original = QgsPointXY(
-                original_point
-            )
-            previous_mapped = QgsPointXY(
-                chosen_point
-            )
-
-
-        # V7.4.2 TERMINAL TRANSITION
-        # Find alle generiske mapped/fallback-grænser i route-sekvensen.
-        # På den mappede side fades den fysiske lane-offset gradvist mod
-        # originalgeometrien over en fast distance langs originalruten.
-        # Dermed undgår vi den direkte "krog" fra corridor-lane til fri rute.
-        if raw_original_points:
-            cumulative_distances = [0.0]
-
-            for point_index in range(
-                1,
-                len(raw_original_points)
-            ):
-                cumulative_distances.append(
-                    cumulative_distances[-1]
-                    + point_distance(
-                        raw_original_points[point_index - 1],
-                        raw_original_points[point_index]
-                    )
-                )
-
-            transition_positions = []
-
-            for point_index in range(
-                1,
-                len(raw_mapping_states)
-            ):
-                if (
-                    raw_mapping_states[point_index]
-                    != raw_mapping_states[point_index - 1]
-                ):
-                    transition_positions.append(
-                        (
-                            cumulative_distances[point_index - 1]
-                            + cumulative_distances[point_index]
-                        )
-                        / 2.0
-                    )
-
-            for (
-                original_point,
-                raw_mapped_point,
-                is_mapped,
-                route_distance
-            ) in zip(
-                raw_original_points,
-                raw_mapped_points,
-                raw_mapping_states,
-                cumulative_distances
-            ):
-                transition_weight = 1.0
-
-                if is_mapped and transition_positions:
-                    distance_to_transition = min(
-                        abs(
-                            route_distance
-                            - transition_position
-                        )
-                        for transition_position
-                        in transition_positions
-                    )
-
-                    transition_weight = min(
-                        1.0,
-                        distance_to_transition
-                        / MANUAL_TERMINAL_TRANSITION_DISTANCE
-                    )
-
-                    # Smoothstep: rolig tangent ved både fri geometri
-                    # og fuld lane-offset.
-                    transition_weight = (
-                        transition_weight
-                        * transition_weight
-                        * (
-                            3.0
-                            - 2.0 * transition_weight
-                        )
-                    )
-
-                if is_mapped:
-                    chosen_point = QgsPointXY(
-                        original_point.x()
-                        + (
-                            raw_mapped_point.x()
-                            - original_point.x()
-                        )
-                        * transition_weight,
-                        original_point.y()
-                        + (
-                            raw_mapped_point.y()
-                            - original_point.y()
-                        )
-                        * transition_weight
-                    )
-                else:
-                    chosen_point = QgsPointXY(
-                        original_point
-                    )
-
-                if (
-                    not mapped_points
-                    or point_distance(
-                        mapped_points[-1],
-                        chosen_point
-                    ) > 0.01
-                ):
-                    mapped_points.append(
-                        chosen_point
-                    )
-
-
-        if len(mapped_points) < 2:
-            continue
-
-        mapped_geometry = QgsGeometry.fromPolylineXY(
-            mapped_points
-        )
-
-        manual_parts_by_route.setdefault(
-            route_no,
-            []
-        ).append(
-            mapped_geometry
-        )
-
-        stats = manual_stats_by_route.setdefault(
-            route_no,
-            {
-                "mapped": 0,
-                "fallback": 0
-            }
-        )
-
-        stats["mapped"] += mapped_count
-        stats["fallback"] += fallback_count
-
-
-    # --------------------------------------------------
-    # ÉN MULTIPART-FEATURE PR. RUTE
-    # --------------------------------------------------
-
+    route_features = []
     manual_features = []
 
-    for route_no in sorted(manual_parts_by_route):
+    for route_no in sorted(parts_by_route):
 
-        parts = manual_parts_by_route[route_no]
+        part_point_lists = [
+            part_points
+            for part_points in parts_by_route[route_no]
+            if len(part_points) >= 2
+        ]
 
-        if not parts:
+        if not part_point_lists:
             continue
 
-        geometry = QgsGeometry.collectGeometry(
-            parts
-        )
+        part_geometries = [
+            QgsGeometry.fromPolylineXY(part_points)
+            for part_points in part_point_lists
+        ]
 
-        if route_closed_by_route.get(route_no, False):
-            closed_points = []
-            if geometry.isMultipart():
-                parts_geometry = geometry.asMultiPolyline()
-                if parts_geometry and parts_geometry[0] and parts_geometry[-1]:
-                    first_point = QgsPointXY(parts_geometry[0][0])
-                    last_point = QgsPointXY(parts_geometry[-1][-1])
-                else:
-                    first_point = None
-                    last_point = None
-            else:
-                polyline = geometry.asPolyline()
-                if polyline:
-                    first_point = QgsPointXY(polyline[0])
-                    last_point = QgsPointXY(polyline[-1])
-                else:
-                    first_point = None
-                    last_point = None
-
-            if (
-                first_point is not None
-                and last_point is not None
-                and point_distance(
-                    first_point,
-                    last_point
-                ) > 1.0
-            ):
-                gap_distance = point_distance(
-                    first_point,
-                    last_point
-                )
-                debug(
-                    "Closed route gap detected for route",
-                    route_no,
-                    "distance:",
-                    gap_distance
-                )
-                debug(
-                    "Repairing closed route geometry by closing the final part."
-                )
-
-                if geometry.isMultipart():
-                    parts_geometry = geometry.asMultiPolyline()
-                    if parts_geometry and parts_geometry[-1]:
-                        parts_geometry[-1].append(
-                            QgsPointXY(first_point)
-                        )
-                        geometry = QgsGeometry.fromMultiPolylineXY(
-                            parts_geometry
-                        )
-                else:
-                    polyline = geometry.asPolyline()
-                    if polyline:
-                        polyline.append(
-                            QgsPointXY(first_point)
-                        )
-                        geometry = QgsGeometry.fromPolylineXY(
-                            polyline
-                        )
-
-                first_point = QgsPointXY(
-                    geometry.asPolyline()[0]
-                ) if not geometry.isMultipart() else QgsPointXY(
-                    geometry.asMultiPolyline()[0][0]
-                )
-                last_point = QgsPointXY(
-                    geometry.asPolyline()[-1]
-                ) if not geometry.isMultipart() else QgsPointXY(
-                    geometry.asMultiPolyline()[-1][-1]
-                )
-
-                if (
-                    first_point is not None
-                    and last_point is not None
-                    and point_distance(
-                        first_point,
-                        last_point
-                    ) > 1.0
-                ):
-                    debug(
-                        "Closed route repair failed for route",
-                        route_no,
-                        "distance:",
-                        point_distance(
-                            first_point,
-                            last_point
-                        ),
-                        "- emitting route with the residual gap instead of "
-                        "aborting the whole run."
-                    )
-                    for transition in route_transition_history:
-                        debug(
-                            "--- corridor transition ---"
-                        )
-                        debug(
-                            "From corridor",
-                            transition["from_corridor"]
-                        )
-                        debug(
-                            "Routes:",
-                            ",".join(
-                                str(r)
-                                for r in transition[
-                                    "prev_routes"
-                                ]
-                            )
-                        )
-                        debug("↓")
-                        debug(
-                            "To corridor",
-                            transition["to_corridor"]
-                        )
-                        debug(
-                            "Routes:",
-                            ",".join(
-                                str(r)
-                                for r in transition[
-                                    "curr_routes"
-                                ]
-                            )
-                        )
-                        debug(
-                            "Lane mapping:",
-                            transition["prev_route_lane"],
-                            "->",
-                            transition["curr_route_lane"],
-                            "(physical",
-                            transition["prev_physical_lane"],
-                            "->",
-                            transition["curr_physical_lane"],
-                            ")"
-                        )
-                    # Non-fatal: one route with a stubborn gap must not discard
-                    # the manual layer for every other route in the run. / En
-                    # enkelt rute med et vedvarende gap må ikke kassere
-                    # manual-laget for alle andre ruter i kørslen.
-
-        route_transition_history_by_route[route_no] = route_transition_history
-
-        stats = manual_stats_by_route.get(
-            route_no,
-            {
-                "mapped": 0,
-                "fallback": 0
-            }
-        )
-
-        feature = QgsFeature(
-            manual_result.fields()
-        )
-
-        feature["route_no"] = route_no
-        feature["name"] = route_name_by_no.get(
+        combined_geometry = QgsGeometry.collectGeometry(part_geometries)
+        length_m = sum(geometry.length() for geometry in part_geometries)
+        name = route_name_by_no.get(
             route_no,
             "Rute {}".format(route_no)
         )
-        feature["part_count"] = len(parts)
-        feature["target_scale"] = MANUAL_TARGET_SCALE
-        feature["length_m"] = geometry.length()
-        feature["mapped_pts"] = stats["mapped"]
-        feature["fallback_pts"] = stats["fallback"]
-        feature.setGeometry(geometry)
 
-        manual_features.append(
-            feature
-        )
+        route_feature = QgsFeature(result.fields())
+        route_feature["route_no"] = route_no
+        route_feature["name"] = name
+        route_feature["part_count"] = len(part_geometries)
+        route_feature["target_scale"] = MANUAL_TARGET_SCALE
+        route_feature["length_m"] = length_m
+        route_feature.setGeometry(QgsGeometry(combined_geometry))
+        route_features.append(route_feature)
 
-
-    manual_provider.addFeatures(
-        manual_features
-    )
-
-    manual_result.updateExtents()
-
-    debug(
-        "Manuelle rutefeatures:",
-        len(manual_features)
-    )
-
-    for feature in manual_features:
-
-        total_points = (
-            feature["mapped_pts"]
-            + feature["fallback_pts"]
-        )
-
-        if total_points > 0:
-            mapped_percent = (
-                100.0
-                * feature["mapped_pts"]
-                / total_points
-            )
-        else:
-            mapped_percent = 0.0
+        manual_feature = QgsFeature(manual_result.fields())
+        manual_feature["route_no"] = route_no
+        manual_feature["name"] = name
+        manual_feature["part_count"] = len(part_geometries)
+        manual_feature["target_scale"] = MANUAL_TARGET_SCALE
+        manual_feature["length_m"] = length_m
+        manual_feature.setGeometry(QgsGeometry(combined_geometry))
+        manual_features.append(manual_feature)
 
         debug(
-            "Rute",
-            feature["route_no"],
-            "→",
-            feature["part_count"],
-            "dele | mapped:",
-            "{:.1f}%".format(mapped_percent),
-            "| fallback:",
-            feature["fallback_pts"]
+            "Route", route_no,
+            "->", len(part_geometries), "part(s)",
+            "| length_m", round(length_m, 1)
         )
 
+    provider.addFeatures(route_features)
+    result.updateExtents()
+
+    manual_provider.addFeatures(manual_features)
+    manual_result.updateExtents()
+
+    debug("")
+    debug("Route features / Rutefeatures:", len(route_features))
 
 
-    return manual_result, manual_features, EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE
+
+    return route_features, manual_features
 
 
 def apply_renderers(lane_features, manual_features, manual_result, result):
     # ==================================================
     # KARTOGRAFISK RENDERER
     #
-    # lane_features har allerede deres endelige, sømmede offset-geometri
-    # (se write_corridors_and_lanes / snap_lane_junctions), så begge lag
-    # tegnes som en almindelig per-rute farvet linjesymbol - ingen
-    # geometry-generator/offset_curve() ved render-tid.
+    # lane_features har allerede deres endelige geometri fra
+    # materialize_route_layers(), så begge lag tegnes som en almindelig
+    # per-rute farvet linjesymbol - ingen geometry-generator/
+    # offset_curve() ved render-tid.
     # ==================================================
 
 
@@ -3645,7 +2541,7 @@ def add_layers_to_project(project, root, group, corridor_result, result, manual_
 
 
 
-def report_results(EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE, corridor_result, corridors, joined_count, manual_result, preferred_order_edges, preferred_order_reversed_count, raw_change_count, result, route_lines, stability_repair_count, stable_change_count):
+def report_results(corridor_result, corridors, joined_count, manual_result, raw_change_count, result, route_lines, stability_repair_count, stable_change_count):
     # ==================================================
     # FINALIZE / AFSLUT
     # ==================================================
@@ -3680,19 +2576,22 @@ def report_results(EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE, corridor_result, corri
     debug("Lane spacing mm / Laneafstand mm:", OUTPUT_LANE_SPACING_MM)
     debug("Line width mm / Linjebredde mm:", LANE_WIDTH_MM)
     debug("Manual target scale / Manuel målestok:", MANUAL_TARGET_SCALE)
-    debug("Effective lane search distance / Effektiv lane søgeafstand:", EFFECTIVE_MANUAL_LANE_SEARCH_DISTANCE)
-    debug("Terminal transition distance / Terminal overgangsafstand:", MANUAL_TERMINAL_TRANSITION_DISTANCE)
-    debug("Preferred-order junctions / Preferred-order junctioner:", len(preferred_order_edges))
-    debug("Preferred-order reversed corridors / Foretrukne reversed korridorer:", preferred_order_reversed_count)
+    debug("Centerline smoothing window / Centerlinje-udjævningsvindue:", CENTERLINE_SMOOTHING_WINDOW)
+    debug("Offset transition taper distance / Offset-overgangs udtoningsafstand:", OFFSET_TRANSITION_TAPER_DISTANCE)
     debug("")
     debug(
-        "CMRL Route Layout contains one multipart feature per original route. / CMRL Route Layout indeholder én multipart-feature pr. original rute."
+        "CMRL Automatic Lanes and CMRL Route Layout are both built directly "
+        "from the corridor topology - one continuous, offset-once feature "
+        "per route, no per-corridor stitching. / CMRL Automatic Lanes og "
+        "CMRL Route Layout er begge bygget direkte fra corridor-topologien "
+        "- én sammenhængende, én-gangs-offsettet feature pr. rute, ingen "
+        "sammensyning mellem corridorer."
     )
     debug(
-        "Geometry is built in the original route order by mapping to the physical lane references. / Geometrien er bygget i originalrutens rækkefølge ved mapping til de fysiske lane-referencer."
-    )
-    debug(
-        "The layer is intended for manual cartographic editing with the Vertex Tool. / Laget er beregnet til manuel kartografisk efterredigering med Vertex Tool."
+        "CMRL Route Layout starts identical to Automatic Lanes and is "
+        "intended for manual cartographic editing with the Vertex Tool. / "
+        "CMRL Route Layout starter identisk med Automatic Lanes og er "
+        "beregnet til manuel kartografisk efterredigering med Vertex Tool."
     )
     debug(
         "The automatic lane layer and corridor layer are added hidden as diagnostic reference layers. / Det automatiske lane-lag og corridor-laget er tilføjet skjult som diagnostiske reference-lag."
@@ -3714,9 +2613,6 @@ class EngineRunResult:
     stability_repairs: int
     raw_corridor_count: int
     joined_corridor_count: int
-    preferred_order_junction_count: int
-    preferred_order_reversed_corridor_count: int
-    effective_manual_lane_search_distance: float
 
 
 def run_engine(parameters=None, route_layers=None, feedback=None):
@@ -3759,32 +2655,29 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
         corridors = materialize_corridors(classified_lines)
         merged_corridors, joined_count = merge_corridors(corridors)
         canonical_corridor_by_index = resolve_corridor_equivalence(merged_corridors)
-        preferred_order_edges, preferred_order_reversed_count = resolve_preferred_order(
-            merged_corridors
+        smooth_corridor_centerlines(merged_corridors)
+
+        corridor_index_data = build_corridor_route_index(
+            merged_corridors,
+            canonical_corridor_by_index
         )
-        corridor_result, corridor_provider, result, provider = create_output_layers(
+
+        corridor_result, corridor_provider, result, provider, manual_result, manual_provider = create_output_layers(
             project, project_crs
         )
-        lane_features, lane_feature_corridor_indices = write_corridors_and_lanes(
+        write_corridor_diagnostics(
             merged_corridors,
             corridor_result,
             corridor_provider,
+        )
+        lane_features, manual_features = materialize_route_layers(
+            classified_lines,
+            corridor_index_data,
+            routes,
             result,
             provider,
-        )
-        lane_features = snap_lane_junctions(
-            merged_corridors,
-            lane_features,
-            lane_feature_corridor_indices,
-        )
-        commit_lane_features(provider, result, lane_features)
-        manual_result, manual_features, effective_search_distance = materialize_manual_routes(
-            project_crs,
-            routes,
-            route_lines,
-            lane_features,
-            lane_feature_corridor_indices,
-            canonical_corridor_by_index,
+            manual_result,
+            manual_provider,
         )
         apply_renderers(lane_features, manual_features, manual_result, result)
         add_layers_to_project(
@@ -3796,13 +2689,10 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
             manual_result,
         )
         report_results(
-            effective_search_distance,
             corridor_result,
             corridors,
             joined_count,
             manual_result,
-            preferred_order_edges,
-            preferred_order_reversed_count,
             raw_change_count,
             result,
             route_lines,
@@ -3821,9 +2711,6 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
             stability_repairs=stability_repair_count,
             raw_corridor_count=len(corridors),
             joined_corridor_count=joined_count,
-            preferred_order_junction_count=len(preferred_order_edges),
-            preferred_order_reversed_corridor_count=preferred_order_reversed_count,
-            effective_manual_lane_search_distance=effective_search_distance,
         )
     finally:
         ENGINE_FEEDBACK = previous_feedback
@@ -3846,19 +2733,14 @@ class CartographicRouteLayoutAlgorithm(QgsProcessingAlgorithm):
     LANE_SPACING_MM = "LANE_SPACING_MM"
     LANE_WIDTH_MM = "LANE_WIDTH_MM"
     TARGET_SCALE = "TARGET_SCALE"
-    SEARCH_DISTANCE = "SEARCH_DISTANCE"
-    CONTINUITY_WEIGHT = "CONTINUITY_WEIGHT"
-    INERTIA_WEIGHT = "INERTIA_WEIGHT"
-    TERMINAL_TRANSITION_DISTANCE = "TERMINAL_TRANSITION_DISTANCE"
-    JUNCTION_DISTANCE = "JUNCTION_DISTANCE"
-    PREFERRED_ORDER_PASSES = "PREFERRED_ORDER_PASSES"
+    CENTERLINE_SMOOTHING_WINDOW = "CENTERLINE_SMOOTHING_WINDOW"
+    OFFSET_TRANSITION_TAPER_DISTANCE = "OFFSET_TRANSITION_TAPER_DISTANCE"
     ADD_DIAGNOSTIC_LAYERS = "ADD_DIAGNOSTIC_LAYERS"
 
     OUT_MANUAL = "OUT_MANUAL"
     OUT_AUTOMATIC = "OUT_AUTOMATIC"
     OUT_CORRIDORS = "OUT_CORRIDORS"
     OUT_ROUTE_COUNT = "OUT_ROUTE_COUNT"
-    OUT_REVERSED_CORRIDORS = "OUT_REVERSED_CORRIDORS"
 
     def name(self):
         return "cartographic_route_layout"
@@ -3934,77 +2816,36 @@ class CartographicRouteLayoutAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(param)
 
         param = QgsProcessingParameterNumber(
-            self.SEARCH_DISTANCE,
-            "Search distance (m) / Søgeafstand (m)",
+            self.CENTERLINE_SMOOTHING_WINDOW,
+            "Centerline smoothing window (m) / Centerlinje-udjævningsvindue (m)",
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=p.mapping.manual_lane_search_distance,
+            defaultValue=p.cartography.centerline_smoothing_window,
             minValue=0.0,
         )
         param.setDescription(
-            "Lane search distance in meters for manual mapping. / Lane-søgeafstand i meter for manuel mapping."
+            "Arc-length window for smoothing a corridor's centerline before any lane "
+            "is offset from it. 0 disables it. / Arc-længde-vindue for udjævning af "
+            "en corridors centerlinje før nogen lane offsettes fra den. 0 deaktiverer det."
         )
         param.setMetadata({"widget_wrapper": {"decimals": 0}})
         self.addParameter(param)
 
         param = QgsProcessingParameterNumber(
-            self.CONTINUITY_WEIGHT,
-            "Continuity weight / Kontinuitetsvægt",
+            self.OFFSET_TRANSITION_TAPER_DISTANCE,
+            "Offset transition taper (m) / Offset-overgangs udtoning (m)",
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=p.mapping.manual_continuity_weight,
+            defaultValue=p.cartography.offset_transition_taper_distance,
             minValue=0.0,
         )
         param.setDescription(
-            "Penalty weight for route continuity at junctions. / Straffeværdi for kontinuitet ved kryds."
+            "Window for tapering a route's offset where its lane_index changes "
+            "(entering/leaving a shared corridor, or between two corridors). 0 "
+            "disables it (a hard step). / Vindue for udtoning af en rutes offset "
+            "hvor dens lane_index ændres. 0 deaktiverer det (hårdt spring)."
         )
         param.setMetadata({"widget_wrapper": {"decimals": 0}})
         self.addParameter(param)
 
-        param = QgsProcessingParameterNumber(
-            self.INERTIA_WEIGHT,
-            "Inertia weight / Inertiavægt",
-            type=QgsProcessingParameterNumber.Double,
-            defaultValue=p.mapping.manual_lane_inertia_weight,
-            minValue=0.0,
-        )
-        param.setDescription(
-            "Penalty weight for lane order inertia. / Straffeværdi for lane-order inerti."
-        )
-        param.setMetadata({"widget_wrapper": {"decimals": 0}})
-        self.addParameter(param)
-
-        param = QgsProcessingParameterNumber(
-            self.TERMINAL_TRANSITION_DISTANCE,
-            "Terminal transition (m) / Terminal overgang (m)",
-            type=QgsProcessingParameterNumber.Double,
-            defaultValue=p.mapping.manual_terminal_transition_distance,
-            minValue=0.0,
-        )
-        param.setDescription(
-            "Distance for the terminal transition from corridor lanes to original route. / Distance for terminal overgang fra corridor-lanes til originalrute."
-        )
-        param.setMetadata({"widget_wrapper": {"decimals": 0}})
-        self.addParameter(param)
-
-        param = QgsProcessingParameterNumber(
-            self.JUNCTION_DISTANCE,
-            "Junction distance (m) / Junctionafstand (m)",
-            type=QgsProcessingParameterNumber.Double,
-            defaultValue=p.preferred_order.junction_distance,
-            minValue=0.0,
-        )
-        param.setDescription(
-            "Preferred-order junction distance in meters. / Preferred-order junctionafstand i meter."
-        )
-        param.setMetadata({"widget_wrapper": {"decimals": 0}})
-        self.addParameter(param)
-
-        self.addParameter(QgsProcessingParameterNumber(
-            self.PREFERRED_ORDER_PASSES,
-            "Preferred-order passes / Preferred-order gennemløb",
-            type=QgsProcessingParameterNumber.Integer,
-            defaultValue=p.preferred_order.passes,
-            minValue=1,
-        ))
         self.addParameter(QgsProcessingParameterBoolean(
             self.ADD_DIAGNOSTIC_LAYERS,
             "Add diagnostic layers / Tilføj diagnostiske lag",
@@ -4023,9 +2864,6 @@ class CartographicRouteLayoutAlgorithm(QgsProcessingAlgorithm):
         self.addOutput(QgsProcessingOutputNumber(
             self.OUT_ROUTE_COUNT, "Route count / Antal ruter"
         ))
-        self.addOutput(QgsProcessingOutputNumber(
-            self.OUT_REVERSED_CORRIDORS, "Preferred-order reversed corridors / Foretrukne reversed korridorer"
-        ))
 
     def processAlgorithm(self, parameters, context, feedback):
         if feedback.isCanceled():
@@ -4035,12 +2873,6 @@ class CartographicRouteLayoutAlgorithm(QgsProcessingAlgorithm):
 
         def get_double(name, default_value):
             value = self.parameterAsDouble(
-                parameters, name, context
-            )
-            return default_value if value is None else value
-
-        def get_int(name, default_value):
-            value = self.parameterAsInt(
                 parameters, name, context
             )
             return default_value if value is None else value
@@ -4069,34 +2901,13 @@ class CartographicRouteLayoutAlgorithm(QgsProcessingAlgorithm):
                     self.TARGET_SCALE,
                     defaults.cartography.manual_target_scale,
                 ),
-            ),
-            mapping=MappingParameters(
-                manual_lane_search_distance=get_double(
-                    self.SEARCH_DISTANCE,
-                    defaults.mapping.manual_lane_search_distance,
+                centerline_smoothing_window=get_double(
+                    self.CENTERLINE_SMOOTHING_WINDOW,
+                    defaults.cartography.centerline_smoothing_window,
                 ),
-                manual_continuity_weight=get_double(
-                    self.CONTINUITY_WEIGHT,
-                    defaults.mapping.manual_continuity_weight,
-                ),
-                manual_lane_inertia_weight=get_double(
-                    self.INERTIA_WEIGHT,
-                    defaults.mapping.manual_lane_inertia_weight,
-                ),
-                manual_terminal_transition_distance=get_double(
-                    self.TERMINAL_TRANSITION_DISTANCE,
-                    defaults.mapping.manual_terminal_transition_distance,
-                ),
-            ),
-            preferred_order=PreferredOrderParameters(
-                junction_distance=get_double(
-                    self.JUNCTION_DISTANCE,
-                    defaults.preferred_order.junction_distance,
-                ),
-                min_shared_routes=defaults.preferred_order.min_shared_routes,
-                passes=get_int(
-                    self.PREFERRED_ORDER_PASSES,
-                    defaults.preferred_order.passes,
+                offset_transition_taper_distance=get_double(
+                    self.OFFSET_TRANSITION_TAPER_DISTANCE,
+                    defaults.cartography.offset_transition_taper_distance,
                 ),
             ),
             corridor=defaults.corridor,
@@ -4129,7 +2940,7 @@ class CartographicRouteLayoutAlgorithm(QgsProcessingAlgorithm):
                     project.removeMapLayer(layer.id())
 
         feedback.pushInfo(
-            f"Done: {engine_result.route_count} routes, {engine_result.preferred_order_reversed_corridor_count} preferred-order reversals. / Færdig: {engine_result.route_count} ruter, {engine_result.preferred_order_reversed_corridor_count} preferred-order reversals."
+            f"Done: {engine_result.route_count} routes. / Færdig: {engine_result.route_count} ruter."
         )
 
         return {
@@ -4137,9 +2948,6 @@ class CartographicRouteLayoutAlgorithm(QgsProcessingAlgorithm):
             self.OUT_AUTOMATIC: engine_result.automatic_lane_layer.id(),
             self.OUT_CORRIDORS: engine_result.corridor_layer.id(),
             self.OUT_ROUTE_COUNT: engine_result.route_count,
-            self.OUT_REVERSED_CORRIDORS: (
-                engine_result.preferred_order_reversed_corridor_count
-            ),
         }
 
 
