@@ -2192,6 +2192,72 @@ def write_corridors_and_lanes(merged_corridors, corridor_result, corridor_provid
     return lane_features, lane_feature_corridor_indices
 
 
+def taper_endpoint_shift(points, endpoint_slot, target_point):
+    # ==================================================
+    # TAPERED ENDPOINT SHIFT / UDTONET ENDEPUNKTSFORSKYDNING
+    #
+    # Moving only the endpoint vertex to a shared junction point leaves
+    # the rest of the lane exactly where it was - so whenever the natural
+    # offset endpoint and the junction point differ by any real distance,
+    # the last segment has to visibly kink to reach it. The correction is
+    # blended back over several points instead, fading out with a
+    # smoothstep so the approach curves gently into the junction rather
+    # than snapping onto it at the last vertex. The taper distance scales
+    # with the size of the correction itself, so a small nudge fades out
+    # quickly and a large one is spread further back.
+    # ==================================================
+
+    original_endpoint = points[endpoint_slot]
+
+    delta_x = target_point.x() - original_endpoint.x()
+    delta_y = target_point.y() - original_endpoint.y()
+
+    if abs(delta_x) < 0.000001 and abs(delta_y) < 0.000001:
+        return points
+
+    delta_magnitude = math.hypot(delta_x, delta_y)
+    taper_distance = max(SAMPLE_DISTANCE * 2.0, delta_magnitude * 3.0)
+
+    point_count = len(points)
+
+    walk_order = (
+        range(point_count)
+        if endpoint_slot == 0
+        else range(point_count - 1, -1, -1)
+    )
+
+    new_points = list(points)
+    cumulative_distance = 0.0
+    previous_point = None
+
+    for index in walk_order:
+
+        current_point = points[index]
+
+        if previous_point is not None:
+            cumulative_distance += point_distance(
+                previous_point,
+                current_point
+            )
+
+        previous_point = current_point
+
+        if cumulative_distance >= taper_distance:
+            break
+
+        weight = 1.0 - cumulative_distance / taper_distance
+        weight = weight * weight * (3.0 - 2.0 * weight)
+
+        new_points[index] = QgsPointXY(
+            current_point.x() + delta_x * weight,
+            current_point.y() + delta_y * weight
+        )
+
+    new_points[endpoint_slot] = QgsPointXY(target_point)
+
+    return new_points
+
+
 def snap_lane_junctions(merged_corridors, lane_features, lane_feature_corridor_indices):
     # ==================================================
     # SØM LANE-JUNCTIONS / SNAP LANE JUNCTIONS
@@ -2473,7 +2539,11 @@ def snap_lane_junctions(merged_corridors, lane_features, lane_feature_corridor_i
         new_points = list(original_points)
 
         for endpoint_slot, (point, _) in slots.items():
-            new_points[endpoint_slot] = point
+            new_points = taper_endpoint_shift(
+                new_points,
+                endpoint_slot,
+                point
+            )
             snapped_point_count += 1
 
         lane_feature.setGeometry(
