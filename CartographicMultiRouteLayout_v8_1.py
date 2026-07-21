@@ -1918,7 +1918,7 @@ def resolve_preferred_order(merged_corridors):
 
 
 
-    return preferred_order_edges, preferred_order_reversed_count, corridor_reversed
+    return preferred_order_edges, preferred_order_reversed_count
 
 
 def create_output_layers(project, project_crs):
@@ -2138,26 +2138,147 @@ def write_corridors_and_lanes(merged_corridors, corridor_result, corridor_provid
     return lane_features, lane_feature_corridor_indices
 
 
-def snap_lane_junctions(
-    lane_features,
-    lane_feature_corridor_indices,
-    preferred_order_edges,
-    corridor_reversed
-):
+def snap_lane_junctions(merged_corridors, lane_features, lane_feature_corridor_indices):
     # ==================================================
     # SØM LANE-JUNCTIONS / SNAP LANE JUNCTIONS
     #
-    # Hver lane har nu sin egen uafhængigt beregnede offsetCurve.
-    # Ved en preferred-order junction deler to corridorer en eller flere
-    # ruter; disse ruters lane-endepunkter rammer generelt ikke præcis
-    # samme koordinat, selvom corridorernes centerlines mødes. Her sømmes
-    # de fælles ruters endepunkter sammen til ét fælles punkt pr. junction,
-    # samme teknik som loop-sømme i merge_corridors.
+    # Hver lane har sin egen uafhængigt beregnede offsetCurve, så to
+    # corridorers lane-endepunkter for samme rute rammer generelt ikke
+    # præcis samme koordinat, selvom corridorernes centerlines mødes.
+    #
+    # Ved en simpel to-vejs junction er et parvist sømme-skridt nok, men
+    # hvor tre eller flere corridorer mødes i samme punkt ("hub"), kan
+    # parvis sømning ikke få alle til at konvergere.
+    #
+    # Klyngning løser det - men KUN hvis man klynger på corridorernes egne
+    # centerline-endepunkter, ikke på lanes' offset-positioner. Lane-
+    # offsets kan sprede sig langt fra hinanden (op til flere titals meter
+    # ved mange ruter i samme corridor), så single-linkage klyngning på
+    # dem kan transitivt kæde to i virkeligheden separate junctions sammen
+    # og kollapse en helt tredje corridors lane til ét eneste punkt.
+    # Centerline-endepunkter er langt færre og repræsenterer den faktiske
+    # topologi, så klyngning der er robust.
+    #
+    # Fremgangsmåde:
+    # 1. Klyng corridorernes egne centerline-endepunkter -> junction-huber.
+    # 2. For hver hub: find de ruter der reelt går igennem mindst to af
+    #    hubbens corridorer, og søm netop de ruters lane-endepunkter
+    #    sammen til ét centroid pr. rute pr. hub.
     # ==================================================
 
     debug("")
     debug("SNAPPING LANE JUNCTIONS / SØMMER LANE-JUNCTIONS")
     debug("----------------------------------------")
+
+    corridor_endpoints = []
+
+    for corridor_index, corridor in enumerate(merged_corridors):
+
+        parts = extract_lines(corridor["geometry"])
+
+        if not parts or len(parts[0]) < 2:
+            continue
+
+        points = parts[0]
+
+        corridor_endpoints.append(
+            (corridor_index, 0, QgsPointXY(points[0]))
+        )
+        corridor_endpoints.append(
+            (corridor_index, -1, QgsPointXY(points[-1]))
+        )
+
+
+    endpoint_count = len(corridor_endpoints)
+    cluster_parent = list(range(endpoint_count))
+
+    # A corridor shorter than PREFERRED_ORDER_JUNCTION_DISTANCE has its own
+    # far end within that distance of its own near end's hub - so a naive
+    # "merge whenever within range" union can pull a short spur's far tip
+    # into the very hub its near end belongs to, corrupting that hub for
+    # every other corridor in it. Candidate merges are therefore processed
+    # closest-first (Kruskal-style), and any merge that would leave a
+    # single corridor with both its ends in the same resulting cluster is
+    # rejected outright, however indirectly it would happen.
+    cluster_corridor_slots = {
+        index: {corridor_endpoints[index][0]: {corridor_endpoints[index][1]}}
+        for index in range(endpoint_count)
+    }
+
+
+    def find_cluster(index):
+
+        while cluster_parent[index] != index:
+            cluster_parent[index] = cluster_parent[cluster_parent[index]]
+            index = cluster_parent[index]
+
+        return index
+
+
+    candidate_merges = []
+
+    for i in range(endpoint_count):
+
+        corridor_i, _, point_i = corridor_endpoints[i]
+
+        for j in range(i + 1, endpoint_count):
+
+            corridor_j, _, point_j = corridor_endpoints[j]
+
+            # A corridor's own two ends can never directly merge.
+            if corridor_i == corridor_j:
+                continue
+
+            distance = point_distance(point_i, point_j)
+
+            if distance <= PREFERRED_ORDER_JUNCTION_DISTANCE:
+                candidate_merges.append((distance, i, j))
+
+
+    candidate_merges.sort(key=lambda merge: merge[0])
+
+    for _, i, j in candidate_merges:
+
+        root_i = find_cluster(i)
+        root_j = find_cluster(j)
+
+        if root_i == root_j:
+            continue
+
+        slots_i = cluster_corridor_slots[root_i]
+        slots_j = cluster_corridor_slots[root_j]
+
+        would_conflict = any(
+            corridor_index in slots_j
+            and (slot_set | slots_j[corridor_index]) == {0, -1}
+            for corridor_index, slot_set in slots_i.items()
+        )
+
+        if would_conflict:
+            continue
+
+        merged_slots = {
+            corridor_index: set(slot_set)
+            for corridor_index, slot_set in slots_i.items()
+        }
+
+        for corridor_index, slot_set in slots_j.items():
+            merged_slots.setdefault(corridor_index, set()).update(slot_set)
+
+        new_root, old_root = sorted((root_i, root_j))
+        cluster_parent[old_root] = new_root
+        cluster_corridor_slots[new_root] = merged_slots
+        del cluster_corridor_slots[old_root]
+
+
+    hubs = {}
+
+    for index in range(endpoint_count):
+        hubs.setdefault(
+            find_cluster(index),
+            []
+        ).append(corridor_endpoints[index])
+
 
     lane_feature_by_corridor_route = {}
 
@@ -2169,88 +2290,154 @@ def snap_lane_junctions(
         lane_feature_by_corridor_route[key] = lane_feature
 
 
-    def lane_points(lane_feature):
+    # A short corridor can legitimately have each of its two ends belong
+    # to a different, genuinely separate hub (e.g. two forks close
+    # together on the real trail network). Snapping both ends independently
+    # is then correct - but if the corridor is short enough, the two
+    # snapped points can end up on top of each other, collapsing the lane
+    # to nothing. Proposals are collected first and only applied once it's
+    # known whether both of a feature's ends are being pulled at once, so
+    # that collapse can be detected and the weaker-supported end skipped.
+    proposed_snaps = {}
+
+    snapped_hub_count = 0
+
+    for hub_members in hubs.values():
+
+        # A hub needs at least two distinct corridors meeting to be a
+        # real junction, not just one corridor's lone endpoint.
+        if len({corridor_index for corridor_index, _, _ in hub_members}) < 2:
+            continue
+
+        routes_at_hub = {}
+
+        for corridor_index, endpoint_slot, _ in hub_members:
+
+            for route_no in merged_corridors[corridor_index]["routes"]:
+
+                lane_feature = lane_feature_by_corridor_route.get(
+                    (corridor_index, route_no)
+                )
+
+                if lane_feature is None:
+                    continue
+
+                routes_at_hub.setdefault(
+                    route_no,
+                    []
+                ).append(
+                    (lane_feature, endpoint_slot)
+                )
+
+        for route_no, members in routes_at_hub.items():
+
+            # Only meaningful if this route actually reaches the hub
+            # through two or more of its corridors.
+            distinct_features = {feature for feature, _ in members}
+
+            if len(distinct_features) < 2:
+                continue
+
+            positions = []
+
+            for lane_feature, endpoint_slot in members:
+
+                parts = extract_lines(lane_feature.geometry())
+
+                if not parts or len(parts[0]) < 2:
+                    continue
+
+                positions.append(
+                    QgsPointXY(parts[0][endpoint_slot])
+                )
+
+            if len(positions) < 2:
+                continue
+
+            centroid = QgsPointXY(
+                sum(point.x() for point in positions) / len(positions),
+                sum(point.y() for point in positions) / len(positions)
+            )
+
+            hub_strength = len(distinct_features)
+
+            for lane_feature, endpoint_slot in members:
+
+                entry = proposed_snaps.setdefault(
+                    id(lane_feature),
+                    {"feature": lane_feature, "slots": {}}
+                )
+
+                entry["slots"][endpoint_slot] = (centroid, hub_strength)
+
+            snapped_hub_count += 1
+
+
+    snapped_point_count = 0
+    collapse_guard_count = 0
+
+    for entry in proposed_snaps.values():
+
+        lane_feature = entry["feature"]
+        slots = entry["slots"]
+
         parts = extract_lines(lane_feature.geometry())
 
-        if not parts:
-            return None
+        if not parts or len(parts[0]) < 2:
+            continue
 
-        return [QgsPointXY(point) for point in parts[0]]
+        original_points = [QgsPointXY(point) for point in parts[0]]
 
+        if len(slots) == 2:
 
-    def current_endpoint(endpoint_original, reversed_flag):
-        return (
-            1 - endpoint_original
-            if reversed_flag
-            else endpoint_original
+            candidate_points = list(original_points)
+
+            for endpoint_slot, (point, _) in slots.items():
+                candidate_points[endpoint_slot] = point
+
+            new_length = QgsGeometry.fromPolylineXY(
+                candidate_points
+            ).length()
+
+            if new_length < MIN_CORRIDOR_LENGTH:
+
+                # Keep only the snap backed by the stronger (larger) hub;
+                # leave the other end at its original, unsnapped position.
+                slot_start, slot_end = sorted(slots.keys())
+                strength_start = slots[slot_start][1]
+                strength_end = slots[slot_end][1]
+
+                weaker_slot = (
+                    slot_start
+                    if strength_start < strength_end
+                    else slot_end
+                )
+
+                del slots[weaker_slot]
+                collapse_guard_count += 1
+
+        new_points = list(original_points)
+
+        for endpoint_slot, (point, _) in slots.items():
+            new_points[endpoint_slot] = point
+            snapped_point_count += 1
+
+        lane_feature.setGeometry(
+            QgsGeometry.fromPolylineXY(new_points)
         )
 
-
-    def midpoint(point1, point2):
-        return QgsPointXY(
-            (point1.x() + point2.x()) / 2.0,
-            (point1.y() + point2.y()) / 2.0
-        )
-
-
-    snapped_count = 0
-
-    for edge in preferred_order_edges:
-
-        corridor_a = edge["a"]
-        corridor_b = edge["b"]
-
-        endpoint_a = current_endpoint(
-            edge["endpoint_a"],
-            corridor_reversed[corridor_a]
-        )
-        endpoint_b = current_endpoint(
-            edge["endpoint_b"],
-            corridor_reversed[corridor_b]
-        )
-
-        for route_no in edge["shared_routes"]:
-
-            feature_a = lane_feature_by_corridor_route.get(
-                (corridor_a, route_no)
-            )
-            feature_b = lane_feature_by_corridor_route.get(
-                (corridor_b, route_no)
-            )
-
-            if feature_a is None or feature_b is None:
-                continue
-
-            points_a = lane_points(feature_a)
-            points_b = lane_points(feature_b)
-
-            if (
-                points_a is None or len(points_a) < 2
-                or points_b is None or len(points_b) < 2
-            ):
-                continue
-
-            index_a = -1 if endpoint_a == 1 else 0
-            index_b = -1 if endpoint_b == 1 else 0
-
-            snapped_point = midpoint(
-                points_a[index_a],
-                points_b[index_b]
-            )
-
-            points_a[index_a] = snapped_point
-            points_b[index_b] = snapped_point
-
-            feature_a.setGeometry(
-                QgsGeometry.fromPolylineXY(points_a)
-            )
-            feature_b.setGeometry(
-                QgsGeometry.fromPolylineXY(points_b)
-            )
-
-            snapped_count += 1
-
-    debug("Lane junctions snapped / Lane-junctions sømmet:", snapped_count)
+    debug(
+        "Route junctions snapped / Rute-junctions sømmet:",
+        snapped_hub_count
+    )
+    debug(
+        "Lane endpoints snapped / Lane-endepunkter sømmet:",
+        snapped_point_count
+    )
+    debug(
+        "Collapse guard triggered / Kollaps-sikring udløst:",
+        collapse_guard_count
+    )
 
 
 
@@ -3448,7 +3635,7 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
         corridors = materialize_corridors(classified_lines)
         merged_corridors, joined_count = merge_corridors(corridors)
         canonical_corridor_by_index = resolve_corridor_equivalence(merged_corridors)
-        preferred_order_edges, preferred_order_reversed_count, corridor_reversed = resolve_preferred_order(
+        preferred_order_edges, preferred_order_reversed_count = resolve_preferred_order(
             merged_corridors
         )
         corridor_result, corridor_provider, result, provider = create_output_layers(
@@ -3462,10 +3649,9 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
             provider,
         )
         lane_features = snap_lane_junctions(
+            merged_corridors,
             lane_features,
             lane_feature_corridor_indices,
-            preferred_order_edges,
-            corridor_reversed,
         )
         commit_lane_features(provider, result, lane_features)
         manual_result, manual_features, effective_search_distance = materialize_manual_routes(
