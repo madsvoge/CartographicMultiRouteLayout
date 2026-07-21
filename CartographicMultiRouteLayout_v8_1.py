@@ -110,15 +110,6 @@ class CartographyParameters:
     offset_segments: int = 8
     offset_miter_limit: float = 2.0
 
-    # Kartografisk udjævning af corridor-centerlinjen før lane-offset.
-    # Dette er et kartografisk værktøj, ikke et præcisionsværktøj - små,
-    # skarpe knæk i centerlinjen (GPS-støj, eller hvor en corridor er
-    # skåret op ved en route-set-grænse) kan få GEOS' offsetCurve til at
-    # danne en selvskærende løkke/spids, især for de yderste lanes med
-    # størst offset. En let udjævning før offset fjerner den slags uden
-    # at ændre rutens kartografiske forløb mærkbart ved produktionsskala.
-    centerline_simplify_tolerance: float = 10.0
-
 
 @dataclass(frozen=True)
 class MappingParameters:
@@ -240,9 +231,6 @@ class EngineParameters:
         if self.cartography.offset_miter_limit <= 0:
             errors.append("offset_miter_limit skal være > 0")
 
-        if self.cartography.centerline_simplify_tolerance < 0:
-            errors.append("centerline_simplify_tolerance skal være >= 0")
-
         if self.mapping.manual_continuity_weight < 0:
             errors.append("manual_continuity_weight skal være >= 0")
 
@@ -299,7 +287,6 @@ def _bind_engine_parameters(parameters):
     global GROUP_NAME, CORRIDOR_RESULT_NAME, RESULT_NAME, MANUAL_RESULT_NAME
     global OUTPUT_LANE_SPACING_MM
     global LANE_WIDTH_MM, MANUAL_TARGET_SCALE, OFFSET_SEGMENTS, OFFSET_MITER_LIMIT
-    global CENTERLINE_SIMPLIFY_TOLERANCE
     global MANUAL_LANE_SEARCH_DISTANCE, MANUAL_CONTINUITY_WEIGHT
     global MANUAL_LANE_INERTIA_WEIGHT, MANUAL_TERMINAL_TRANSITION_DISTANCE
     global PREFERRED_ORDER_JUNCTION_DISTANCE, PREFERRED_ORDER_MIN_SHARED_ROUTES
@@ -320,7 +307,6 @@ def _bind_engine_parameters(parameters):
     MANUAL_TARGET_SCALE = parameters.cartography.manual_target_scale
     OFFSET_SEGMENTS = parameters.cartography.offset_segments
     OFFSET_MITER_LIMIT = parameters.cartography.offset_miter_limit
-    CENTERLINE_SIMPLIFY_TOLERANCE = parameters.cartography.centerline_simplify_tolerance
 
     MANUAL_LANE_SEARCH_DISTANCE = parameters.mapping.manual_lane_search_distance
     MANUAL_CONTINUITY_WEIGHT = parameters.mapping.manual_continuity_weight
@@ -2048,27 +2034,6 @@ def write_corridors_and_lanes(merged_corridors, corridor_result, corridor_provid
         geometry = corridor["geometry"]
         length_m = geometry.length()
 
-        # Cartographic tool, not a precision one: a small, sharp kink in
-        # the centerline (GPS noise, or a corridor cut at a route-set
-        # boundary) can make GEOS' offsetCurve fold into a self-
-        # intersecting loop, worst on the outer lanes with the largest
-        # offset. A light simplify before offsetting removes that without
-        # a visible effect on the route's shape at production scale. The
-        # raw, unsimplified geometry is still what's written to the
-        # corridor feature itself, for diagnostics.
-        if CENTERLINE_SIMPLIFY_TOLERANCE > 0:
-            offset_source_geometry = geometry.simplify(
-                CENTERLINE_SIMPLIFY_TOLERANCE
-            )
-
-            if (
-                offset_source_geometry.isNull()
-                or offset_source_geometry.isEmpty()
-            ):
-                offset_source_geometry = geometry
-        else:
-            offset_source_geometry = geometry
-
         corridor_feature = QgsFeature(
             corridor_result.fields()
         )
@@ -2108,9 +2073,9 @@ def write_corridors_and_lanes(merged_corridors, corridor_result, corridor_provid
             )
 
             if abs(physical_offset) < 0.000001:
-                lane_geometry = offset_source_geometry
+                lane_geometry = geometry
             else:
-                lane_geometry = offset_source_geometry.offsetCurve(
+                lane_geometry = geometry.offsetCurve(
                     physical_offset,
                     OFFSET_SEGMENTS,
                     Qgis.JoinStyle.Round,
@@ -3756,7 +3721,6 @@ class CartographicRouteLayoutAlgorithm(QgsProcessingAlgorithm):
     LAYER_LIST = "LAYER_LIST"
     LANE_SPACING_MM = "LANE_SPACING_MM"
     LANE_WIDTH_MM = "LANE_WIDTH_MM"
-    CENTERLINE_SIMPLIFY_TOLERANCE = "CENTERLINE_SIMPLIFY_TOLERANCE"
     TARGET_SCALE = "TARGET_SCALE"
     SEARCH_DISTANCE = "SEARCH_DISTANCE"
     CONTINUITY_WEIGHT = "CONTINUITY_WEIGHT"
@@ -3830,23 +3794,6 @@ class CartographicRouteLayoutAlgorithm(QgsProcessingAlgorithm):
             "Width of the output lane lines in millimeters. / Bredde på output-linjerne i millimeter."
         )
         param.setMetadata({"widget_wrapper": {"decimals": 2}})
-        self.addParameter(param)
-
-        param = QgsProcessingParameterNumber(
-            self.CENTERLINE_SIMPLIFY_TOLERANCE,
-            "Centerline simplify tolerance (m) / Udjævningstolerance for centerlinje (m)",
-            type=QgsProcessingParameterNumber.Double,
-            defaultValue=p.cartography.centerline_simplify_tolerance,
-            minValue=0.0,
-        )
-        param.setDescription(
-            "Cartographic smoothing applied to a corridor's centerline before lane "
-            "offsetting, to avoid self-intersecting offset curves at sharp bends. "
-            "0 disables it. / Kartografisk udjævning af en corridors centerlinje "
-            "før lane-offset, for at undgå selvskærende offset-kurver ved skarpe "
-            "knæk. 0 deaktiverer det."
-        )
-        param.setMetadata({"widget_wrapper": {"decimals": 1}})
         self.addParameter(param)
 
         param = QgsProcessingParameterNumber(
@@ -3993,10 +3940,6 @@ class CartographicRouteLayoutAlgorithm(QgsProcessingAlgorithm):
                 lane_width_mm=get_double(
                     self.LANE_WIDTH_MM,
                     defaults.cartography.lane_width_mm,
-                ),
-                centerline_simplify_tolerance=get_double(
-                    self.CENTERLINE_SIMPLIFY_TOLERANCE,
-                    defaults.cartography.centerline_simplify_tolerance,
                 ),
                 manual_target_scale=get_double(
                     self.TARGET_SCALE,
