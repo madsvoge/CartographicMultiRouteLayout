@@ -169,15 +169,6 @@ class CorridorParameters:
     # about whether a route is closed.
     loop_closure_tolerance: float = 5.0
 
-    # Minimum sammenhængende længde et match mellem to af rutens egne
-    # segmenter skal opretholdes over, før det behandles som en reel
-    # selv-overlap/retur-arm frem for en almindelig kurve eller en kort
-    # tilfældig krydsning. / Minimum sustained length a match between two
-    # of a route's own segments must hold up over before it is treated as
-    # a genuine self-overlap (out-and-back retrace) rather than an
-    # ordinary bend or a brief incidental crossing.
-    self_overlap_min_separation: float = 150.0
-
     @property
     def angle_tolerance_radians(self):
         return math.radians(self.angle_tolerance_degrees)
@@ -228,7 +219,6 @@ class EngineParameters:
             ("min_stable_length", self.corridor.min_stable_length),
             ("min_corridor_length", self.corridor.min_corridor_length),
             ("loop_closure_tolerance", self.corridor.loop_closure_tolerance),
-            ("self_overlap_min_separation", self.corridor.self_overlap_min_separation),
         )
 
         for name, value in positive_values:
@@ -305,7 +295,7 @@ def _bind_engine_parameters(parameters):
     global SAMPLE_DISTANCE, MATCH_DISTANCE, ANGLE_TOLERANCE
     global MIN_STABLE_LENGTH, STABILITY_PASSES, MIN_CORRIDOR_LENGTH
     global INDEX_SEARCH_MARGIN
-    global LOOP_CLOSURE_TOLERANCE, SELF_OVERLAP_MIN_SEPARATION
+    global LOOP_CLOSURE_TOLERANCE
 
     GROUP_NAME = parameters.io.output_group_name
     CORRIDOR_RESULT_NAME = parameters.io.corridor_result_name
@@ -340,7 +330,6 @@ def _bind_engine_parameters(parameters):
     MIN_CORRIDOR_LENGTH = parameters.corridor.min_corridor_length
     INDEX_SEARCH_MARGIN = parameters.corridor.index_search_margin
     LOOP_CLOSURE_TOLERANCE = parameters.corridor.loop_closure_tolerance
-    SELF_OVERLAP_MIN_SEPARATION = parameters.corridor.self_overlap_min_separation
 
     return parameters
 
@@ -888,218 +877,6 @@ def load_routes(routes, project_crs, project):
 
     debug("")
     debug("Route lines / Rutelinjer:", len(route_lines))
-
-
-
-    return route_lines
-
-
-def detect_self_overlaps(route_lines, project_crs):
-    # ==================================================
-    # SELF-OVERLAP SNAPPING / SELV-OVERLAP SNAPPING
-    #
-    # A route that retraces its own path (an out-and-back spur, or a loop
-    # that returns along the same road) is never matched against itself in
-    # classify_route_sets - only different route numbers are compared there.
-    # Left alone, the outbound and return arms are two independently
-    # recorded/sampled polylines that are only approximately coincident
-    # (GPS noise, and resampling continues by arc-length through the
-    # turnaround rather than restarting per arm), so they end up as two
-    # close but visibly distinct lines instead of one.
-    #
-    # This pass finds, for each route, stretches where it runs back over
-    # itself using the same distance/angle matching as cross-route
-    # classification, then snaps the later (return) stretch onto the
-    # earlier (outbound) stretch's own points, so both are materialized
-    # from the same geometry and render as a single overlapping line.
-    #
-    # The tricky part is telling a genuine retrace apart from an ordinary
-    # bend or a straight stretch: on a straight (or gently curved) line,
-    # nearby segments are always "parallel and close" to each other by
-    # construction, which would make cross-route-style distance/angle
-    # matching alone fire on nearly every segment. What actually
-    # distinguishes a real retrace is that travelling along the route from
-    # the earlier segment to the later one requires a substantial detour
-    # (out to a turnaround and back) compared to the direct distance
-    # between them - for an ordinary continuing stretch, walking along the
-    # route *is* essentially the direct path. SELF_OVERLAP_MIN_SEPARATION
-    # is the minimum size of that detour.
-    # ==================================================
-
-    debug("")
-    debug("DETECTING SELF-OVERLAPS / DETEKTERER SELV-OVERLAP")
-    debug("----------------------------------------")
-
-    snapped_point_count = 0
-    affected_route_count = 0
-
-    for route_line in route_lines:
-        points = route_line["points"]
-        segment_count = len(points) - 1
-
-        if segment_count < 2:
-            continue
-
-        along_route = cumulative_distances(points)
-
-        local_layer = QgsVectorLayer(
-            "LineString?crs=" + project_crs.authid(),
-            "_temporary_self_overlap_index",
-            "memory"
-        )
-        local_provider = local_layer.dataProvider()
-        local_provider.addAttributes([QgsField("segment_index", QVariant.Int)])
-        local_layer.updateFields()
-
-        local_features = []
-        local_angles = []
-
-        for segment_index in range(segment_count):
-            point1 = points[segment_index]
-            point2 = points[segment_index + 1]
-            local_angles.append(segment_angle(point1, point2))
-            feature = QgsFeature(local_layer.fields())
-            feature["segment_index"] = segment_index
-            feature.setGeometry(QgsGeometry.fromPolylineXY([point1, point2]))
-            local_features.append(feature)
-
-        local_provider.addFeatures(local_features)
-        fid_to_index = {
-            feature.id(): int(feature["segment_index"])
-            for feature in local_layer.getFeatures()
-        }
-        local_index = QgsSpatialIndex(local_layer.getFeatures())
-
-        # For every segment, find the best-matching EARLIER segment of the
-        # same route, using the same distance/angle rules as cross-route
-        # matching. Only later->earlier links are kept, so the first
-        # occurrence of a retraced stretch stays the untouched anchor and
-        # only the repeat gets pulled onto it.
-        match_target = [None] * segment_count
-
-        for segment_index in range(segment_count):
-            point1 = points[segment_index]
-            point2 = points[segment_index + 1]
-            segment_geometry = QgsGeometry.fromPolylineXY([point1, point2])
-            angle = local_angles[segment_index]
-
-            search_rectangle = segment_geometry.boundingBox()
-            search_rectangle.grow(MATCH_DISTANCE)
-
-            best_index = None
-            best_distance = None
-
-            for candidate_fid in local_index.intersects(search_rectangle):
-                candidate_index = fid_to_index.get(candidate_fid)
-
-                if candidate_index is None or candidate_index >= segment_index:
-                    continue
-
-                # Require a genuine detour: travelling along the route from
-                # the candidate segment to this one must be substantially
-                # longer than the direct distance between them, otherwise
-                # this is just the next bit of the same continuing stretch.
-                along_route_gap = (
-                    along_route[segment_index] - along_route[candidate_index]
-                )
-                straight_gap = point_distance(
-                    points[candidate_index],
-                    points[segment_index]
-                )
-
-                if (
-                    along_route_gap - straight_gap
-                    < SELF_OVERLAP_MIN_SEPARATION
-                ):
-                    continue
-
-                candidate_point1 = points[candidate_index]
-                candidate_point2 = points[candidate_index + 1]
-                candidate_geometry = QgsGeometry.fromPolylineXY(
-                    [candidate_point1, candidate_point2]
-                )
-
-                distance = segment_geometry.distance(candidate_geometry)
-
-                if distance > MATCH_DISTANCE:
-                    continue
-
-                difference = angle_difference(angle, local_angles[candidate_index])
-
-                if difference > ANGLE_TOLERANCE:
-                    continue
-
-                if best_distance is None or distance < best_distance:
-                    best_distance = distance
-                    best_index = candidate_index
-
-            match_target[segment_index] = best_index
-
-        has_match = [target is not None for target in match_target]
-        runs = build_runs(has_match)
-        segment_lengths = [
-            point_distance(points[index], points[index + 1])
-            for index in range(segment_count)
-        ]
-
-        route_snapped = False
-
-        for run in runs:
-
-            if not run["value"]:
-                continue
-
-            # The detour check above already does the real "is this a
-            # genuine retrace" test; this is just a noise floor against a
-            # single isolated segment matching by fluke.
-            if run_length(run, segment_lengths) < MIN_CORRIDOR_LENGTH:
-                continue
-
-            targets_in_run = [
-                match_target[index]
-                for index in range(run["start"], run["end"] + 1)
-                if match_target[index] is not None
-            ]
-
-            if not targets_in_run:
-                continue
-
-            anchor_start = min(targets_in_run)
-            anchor_end = max(targets_in_run) + 1
-
-            anchor_geometry = QgsGeometry.fromPolylineXY(
-                points[anchor_start:anchor_end + 1]
-            )
-
-            for point_index in range(run["start"], run["end"] + 2):
-                point_geometry = QgsGeometry.fromPointXY(points[point_index])
-                nearest = anchor_geometry.nearestPoint(point_geometry)
-
-                if nearest.isNull() or nearest.isEmpty():
-                    continue
-
-                points[point_index] = QgsPointXY(nearest.asPoint())
-                snapped_point_count += 1
-                route_snapped = True
-
-        if route_snapped:
-            affected_route_count += 1
-
-        debug(
-            "Self-overlap / Selv-overlap:",
-            route_line["route_no"],
-            "snapped" if route_snapped else "none"
-        )
-
-    debug("")
-    debug(
-        "Self-overlap snapped points / Selv-overlap snappede punkter:",
-        snapped_point_count
-    )
-    debug(
-        "Routes with self-overlap / Ruter med selv-overlap:",
-        affected_route_count
-    )
 
 
 
@@ -3659,7 +3436,6 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
 
         routes = discover_routes(route_layers or [])
         route_lines = load_routes(routes, project_crs, project)
-        route_lines = detect_self_overlaps(route_lines, project_crs)
         segment_records, fid_to_segment_id, segment_spatial_index = build_segment_index(
             route_lines, project_crs
         )
