@@ -1089,9 +1089,11 @@ def build_segment_index(route_lines, project_crs):
     segment_index_layer.updateFields()
     segment_records = {}
     segment_features = []
+    route_segment_ids = {}
     next_segment_id = 0
     for route_line in route_lines:
         points = route_line["points"]
+        route_segment_ids[route_line["route_no"]] = []
         for segment_index in range(len(points) - 1):
             point1 = points[segment_index]
             point2 = points[segment_index + 1]
@@ -1101,6 +1103,7 @@ def build_segment_index(route_lines, project_crs):
                 "geometry": geometry,
                 "angle": segment_angle(point1, point2),
             }
+            route_segment_ids[route_line["route_no"]].append(next_segment_id)
             feature = QgsFeature(segment_index_layer.fields())
             feature["segment_id"] = next_segment_id
             feature.setGeometry(geometry)
@@ -1112,22 +1115,120 @@ def build_segment_index(route_lines, project_crs):
     debug("Index segments / Indekssegmenter:", len(segment_records))
 
 
-    return segment_records, fid_to_segment_id, segment_spatial_index
+    return segment_records, fid_to_segment_id, segment_spatial_index, route_segment_ids
 
 
-def classify_route_sets(route_lines, segment_records, fid_to_segment_id, segment_spatial_index):
+def cluster_segments_by_proximity(segment_records, fid_to_segment_id, segment_spatial_index):
     # ==================================================
-    # KLASSIFICER ROUTE-SET - DIREKTE SEGMENTKANDIDATER
+    # SYMMETRISK SEGMENT-KLYNGE / SYMMETRIC SEGMENT CLUSTERING
+    #
+    # Two routes travelling the same physical stretch can never be
+    # allowed to disagree about it - but letting each route's own local
+    # search independently decide "which other routes do I see near my
+    # segment" is exactly what allows that: different sampling
+    # boundaries and independent per-route stabilization mean route A
+    # can detect route B as a neighbour while route B's own scan of the
+    # same physical spot fails to detect A back. That asymmetry used to
+    # be silently absorbed by the old per-point nearest-lane search this
+    # rewrite retired - which is exactly the noisy, patch-like behaviour
+    # this rewrite was meant to remove, not reintroduce.
+    #
+    # Clustering directly on segments removes the asymmetry by
+    # construction: any two segments found within tolerance are unioned
+    # into the same cluster, and every route's route-set at that
+    # location is read back from the cluster it belongs to - not
+    # decided independently per route. Two routes in the same cluster
+    # get the identical route-set; there is no per-route decision left
+    # to disagree.
+    # ==================================================
+
+    parent = list(range(len(segment_records)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(index1, index2):
+        root1 = find(index1)
+        root2 = find(index2)
+        if root1 == root2:
+            return
+        if root1 < root2:
+            parent[root2] = root1
+        else:
+            parent[root1] = root2
+
+    for segment_id, segment in segment_records.items():
+
+        search_rectangle = segment["geometry"].boundingBox()
+        search_rectangle.grow(INDEX_SEARCH_MARGIN)
+        candidate_fids = segment_spatial_index.intersects(search_rectangle)
+
+        for candidate_fid in candidate_fids:
+
+            candidate_segment_id = fid_to_segment_id.get(candidate_fid)
+
+            # Each pair only needs handling once - and skips comparing a
+            # segment against itself.
+            if (
+                candidate_segment_id is None
+                or candidate_segment_id <= segment_id
+            ):
+                continue
+
+            candidate = segment_records[candidate_segment_id]
+
+            if candidate["route_no"] == segment["route_no"]:
+                continue
+
+            distance = segment["geometry"].distance(candidate["geometry"])
+
+            if distance > MATCH_DISTANCE:
+                continue
+
+            difference = angle_difference(segment["angle"], candidate["angle"])
+
+            if difference > ANGLE_TOLERANCE:
+                continue
+
+            union(segment_id, candidate_segment_id)
+
+    cluster_routes = {}
+
+    for segment_id, segment in segment_records.items():
+        cluster_routes.setdefault(find(segment_id), set()).add(segment["route_no"])
+
+    segment_route_set = {
+        segment_id: route_set_key(cluster_routes[find(segment_id)])
+        for segment_id in segment_records
+    }
+
+    return segment_route_set
+
+
+def classify_route_sets(route_lines, segment_records, fid_to_segment_id, segment_spatial_index, route_segment_ids):
+    # ==================================================
+    # KLASSIFICER ROUTE-SET - SYMMETRISK SEGMENT-KLYNGE
     # ==================================================
     debug("")
     debug("CLASSIFYING CORRIDORS / KLASSIFICERER KORRIDORER")
     debug("----------------------------------------")
+
+    segment_route_set = cluster_segments_by_proximity(
+        segment_records,
+        fid_to_segment_id,
+        segment_spatial_index
+    )
+
     classified_lines = []
     raw_change_count = 0
     stable_change_count = 0
     stability_repair_count = 0
     for line_counter, route_line in enumerate(route_lines, start=1):
         points = route_line["points"]
+        segment_ids = route_segment_ids[route_line["route_no"]]
         segment_lengths = []
         raw_route_sets = []
         for segment_index in range(len(points) - 1):
@@ -1135,35 +1236,8 @@ def classify_route_sets(route_lines, segment_records, fid_to_segment_id, segment
             point2 = points[segment_index + 1]
             segment_length = point_distance(point1, point2)
             segment_lengths.append(segment_length)
-            segment_geometry = QgsGeometry.fromPolylineXY([point1, point2])
-            angle = segment_angle(point1, point2)
-            search_rectangle = segment_geometry.boundingBox()
-            search_rectangle.grow(INDEX_SEARCH_MARGIN)
-            candidate_fids = segment_spatial_index.intersects(search_rectangle)
-            matched_routes = {route_line["route_no"]}
-            best_by_route = {}
-            for candidate_fid in candidate_fids:
-                candidate_segment_id = fid_to_segment_id.get(candidate_fid)
-                if candidate_segment_id is None:
-                    continue
-                candidate = segment_records.get(candidate_segment_id)
-                if candidate is None:
-                    continue
-                candidate_route_no = candidate["route_no"]
-                if candidate_route_no == route_line["route_no"]:
-                    continue
-                local_distance = segment_geometry.distance(candidate["geometry"])
-                if local_distance > MATCH_DISTANCE:
-                    continue
-                difference = angle_difference(angle, candidate["angle"])
-                if difference > ANGLE_TOLERANCE:
-                    continue
-                score = (local_distance, difference)
-                previous_best = best_by_route.get(candidate_route_no)
-                if previous_best is None or score < previous_best:
-                    best_by_route[candidate_route_no] = score
-            matched_routes.update(best_by_route.keys())
-            raw_route_sets.append(route_set_key(matched_routes))
+            segment_id = segment_ids[segment_index]
+            raw_route_sets.append(segment_route_set[segment_id])
         raw_runs = build_runs(raw_route_sets)
         raw_change_count += max(0, len(raw_runs) - 1)
         stable_route_sets, repairs = stabilize_route_sets(raw_route_sets, segment_lengths)
@@ -2643,7 +2717,7 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
 
         routes = discover_routes(route_layers or [])
         route_lines = load_routes(routes, project_crs, project)
-        segment_records, fid_to_segment_id, segment_spatial_index = build_segment_index(
+        segment_records, fid_to_segment_id, segment_spatial_index, route_segment_ids = build_segment_index(
             route_lines, project_crs
         )
         classified_lines, raw_change_count, stable_change_count, stability_repair_count = classify_route_sets(
@@ -2651,6 +2725,7 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
             segment_records,
             fid_to_segment_id,
             segment_spatial_index,
+            route_segment_ids,
         )
         corridors = materialize_corridors(classified_lines)
         merged_corridors, joined_count = merge_corridors(corridors)
