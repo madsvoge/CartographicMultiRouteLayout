@@ -42,18 +42,21 @@ from dataclasses import dataclass, field
 #
 # Automatic cartographic layout of overlapping routes. / Automatisk kartografisk layout af overlappende ruter.
 #
-# Version: 8.2
+# Version: 8.3
 #
 # Version history / Versionshistorik
 # 7.x  Development
 # 7.4  Stable cartographic algorithm
 # 8.0  Processing Tool architecture
 # 8.2  Cartographic Multi-Route Layout
+# 8.3  Topology-first corridor equivalence (corrected_routes diagnostics)
+# 8.4  assemble_route_path driven directly by per-point corridor
+#      proximity, not by each route's own classify_route_sets runs
 #
 # =============================================================================
 
 
-VERSION = "8.2"
+VERSION = "8.4"
 
 ENGINE_FEEDBACK = None
 
@@ -1994,9 +1997,18 @@ def build_corridor_route_index(merged_corridors, canonical_corridor_by_index, co
         points = [QgsPointXY(point) for point in parts[0]]
         distances = cumulative_distances(points)
 
+        # Grown by MATCH_DISTANCE so a point that's genuinely within
+        # tolerance of the corridor can never fall just outside its own
+        # bounding box - used only as a cheap pre-filter in
+        # match_route_points_to_corridors() below, before the real
+        # (much more expensive) nearest-point-on-polyline check.
+        bounding_box = corridor["geometry"].boundingBox()
+        bounding_box.grow(MATCH_DISTANCE)
+
         corridor_cache[corridor_index] = {
             "points": points,
             "distances": distances,
+            "bounding_box": bounding_box,
         }
 
         routes = corridor_routes_by_canonical_index.get(
@@ -2117,19 +2129,135 @@ def match_run_to_corridor(corridor_index_data, route_no, run_start, run_end):
     }
 
 
+def point_within_bounding_box(point, bounding_box):
+
+    return (
+        bounding_box.xMinimum() <= point.x() <= bounding_box.xMaximum()
+        and bounding_box.yMinimum() <= point.y() <= bounding_box.yMaximum()
+    )
+
+
+def is_beyond_polyline_end(point, polyline_points, position, total_length):
+    # ==================================================
+    # UD OVER POLYLINJENS ENDE / BEYOND THE POLYLINE'S END
+    #
+    # nearest_position_on_polyline() clamps its projection to each
+    # segment, so a point sitting just past a corridor's real endpoint -
+    # still travelling in the same direction, exactly the case right
+    # where a route is genuinely leaving a shared stretch - reports a
+    # small "distance to the line" via that endpoint, easily within
+    # MATCH_DISTANCE. That is correct for match_run_to_corridor()'s use
+    # (finding where an already-confirmed run enters/exits its corridor),
+    # but wrong for deciding per-point membership here: it would extend
+    # every corridor's effective capture zone by MATCH_DISTANCE past each
+    # of its own ends, silently pulling a route's solo continuation back
+    # onto a corridor it has already left. Checking the sign of the
+    # projection onto the boundary segment's own direction (not clamped)
+    # tells the two cases apart.
+    # ==================================================
+
+    epsilon = 0.000001
+
+    if position <= epsilon:
+        a, b = polyline_points[0], polyline_points[1]
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        dot = (point.x() - a.x()) * dx + (point.y() - a.y()) * dy
+        return dot < 0.0
+
+    if position >= total_length - epsilon:
+        a, b = polyline_points[-2], polyline_points[-1]
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        dot = (point.x() - b.x()) * dx + (point.y() - b.y()) * dy
+        return dot > 0.0
+
+    return False
+
+
+def match_route_points_to_corridors(points, route_no, corridor_index_data):
+    # ==================================================
+    # MATCH RUTE-PUNKTER TIL CORRIDORER LANGS RUTEN
+    #
+    # For every point along this route's own path, finds which corridor
+    # (if any) this route is a member of - per the corrected topology
+    # from resolve_corridor_equivalence(), not this route's own
+    # classify_route_sets() guess - AND is physically near right there.
+    # This is what determines run boundaries for assemble_route_path()
+    # below directly and continuously from the topology, instead of
+    # trusting classify_route_sets()'s own per-route runs to even notice
+    # a stretch is shared in the first place: a route's own detection can
+    # fail to flag sharing at all (not just get the membership wrong), in
+    # which case nothing ever consulted the corrected topology for it,
+    # however correct that topology already was - the actual remaining
+    # gap after the topology-first rewrite.
+    #
+    # Bounding-box pre-filtering (grown by MATCH_DISTANCE, precomputed in
+    # build_corridor_route_index()) keeps this affordable: checking every
+    # point of every route against every corridor's full geometry
+    # without it does not scale to real route/corridor sizes.
+    # ==================================================
+
+    candidates = corridor_index_data["corridors_by_route_no"].get(route_no, [])
+    corridor_cache = corridor_index_data["corridor_cache"]
+
+    matched_corridor = []
+
+    for point in points:
+
+        best_corridor_index = None
+        best_distance = None
+
+        for corridor_index in candidates:
+
+            cached = corridor_cache.get(corridor_index)
+
+            if cached is None:
+                continue
+
+            if not point_within_bounding_box(point, cached["bounding_box"]):
+                continue
+
+            position, _, distance = nearest_position_on_polyline(
+                point, cached["points"], cached["distances"]
+            )
+
+            if distance is None or distance > MATCH_DISTANCE:
+                continue
+
+            if is_beyond_polyline_end(
+                point, cached["points"], position, cached["distances"][-1]
+            ):
+                continue
+
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_corridor_index = corridor_index
+
+        matched_corridor.append(best_corridor_index)
+
+    return matched_corridor
+
+
 def assemble_route_path(classified_line, corridor_index_data):
     # ==================================================
     # SAMMENSÆT RUTE-STRÆKNING FRA TOPOLOGI / ASSEMBLE ROUTE PATH FROM TOPOLOGY
     #
-    # classify_route_sets() already walks this route's own points in
-    # travel order and splits them into stable runs, each with a
-    # locally-guessed route-set - only used here as a coarse "is this
-    # stretch plausibly shared with anyone" gate (len(routes_key) >= 2),
-    # not trusted for who exactly. match_run_to_corridor() below looks
-    # the corridor up by this route's own number against the corrected
-    # topology from resolve_corridor_equivalence() instead, so the
-    # correct, complete set of routes at each corridor is used - not
-    # whatever this route's own noisy local detection happened to see.
+    # Run boundaries come from match_route_points_to_corridors() above -
+    # which corridor (if any) this route is a member of AND physically
+    # near, checked continuously along its own points - not from
+    # classify_route_sets()'s own runs. build_runs() alone groups this
+    # per-point corridor-identity sequence into runs (wrapped as
+    # single-element tuples, or an empty tuple for "no corridor here").
+    # stabilize_route_sets()'s repair pass is deliberately NOT used here:
+    # it exists to smooth GPS-noise-scale flicker in classify_route_sets()'s
+    # own per-route classification, where a short run really is ambiguous
+    # noise. Here a short run right at a corridor's boundary is not noise -
+    # it is this route's own path genuinely continuing past the corridor's
+    # detected end - and running the repair pass on it merges that boundary
+    # signal into the adjacent corridor-matched run, silently re-extending
+    # the match past the corridor's real geometry (confirmed directly: this
+    # was the exact cause of the assembled path getting truncated to the
+    # corridor's own extent instead of the route's true endpoints).
+    #
     # For each run, this either takes the route's own points (unshared
     # stretches, or a shared guess with no real corridor match -
     # lane_index 0, nothing to offset from) or the matching corridor's
@@ -2156,14 +2284,49 @@ def assemble_route_path(classified_line, corridor_index_data):
     route_line = classified_line["line"]
     route_no = route_line["route_no"]
     points = route_line["points"]
-    runs = classified_line["runs"]
+
+    matched_corridor = match_route_points_to_corridors(
+        points, route_no, corridor_index_data
+    )
+
+    # A segment counts as "on corridor C" only if BOTH its endpoints are
+    # matched to C - using only the start point's match would shift the
+    # detected corridor boundary by one whole segment past the corridor's
+    # true end (confirmed directly: a route continuing straight past a
+    # corridor's real end was getting its final approach segment - whose
+    # start point is still the corridor's own last point - misclassified
+    # as "on the corridor", stretching match_run_to_corridor's query past
+    # the corridor's real geometry and truncating the assembled path to
+    # the corridor's own extent instead of the route's true endpoints).
+    raw_values = [
+        (matched_corridor[index],)
+        if (
+            matched_corridor[index] is not None
+            and matched_corridor[index] == matched_corridor[index + 1]
+        )
+        else ()
+        for index in range(len(points) - 1)
+    ]
+
+    # No stabilize_route_sets() here, deliberately: its MIN_STABLE_LENGTH
+    # repair pass exists to smooth GPS-noise-scale flicker in the OLD
+    # per-route pairwise route-set classification, where a short run was
+    # ambiguous noise to be reconciled with a neighbour. Here a short run
+    # right at a corridor's boundary is not noise - it is the exact signal
+    # that this route's own path continues past the corridor's real
+    # extent. Running the repair pass on this data silently merged that
+    # boundary run into the corridor-matched run next to it, undoing the
+    # is_beyond_polyline_end() fix and truncating the assembled path back
+    # to the corridor's own extent (confirmed directly: repair_count == 2
+    # for this exact scenario). build_runs() alone just groups consecutive
+    # equal values with no repair, which is what this per-point,
+    # already-precise proximity signal needs.
+    runs = build_runs(raw_values)
 
     assembled_points = []
     assembled_offsets = []
 
     for run in runs:
-
-        routes_key = run["value"]
 
         run_points = points[run["start"]: run["end"] + 2]
 
@@ -2173,7 +2336,7 @@ def assemble_route_path(classified_line, corridor_index_data):
         piece_points = None
         lane_index = 0.0
 
-        if len(routes_key) >= 2:
+        if run["value"]:
 
             match = match_run_to_corridor(
                 corridor_index_data,
