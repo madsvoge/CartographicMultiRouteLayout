@@ -56,11 +56,23 @@ from dataclasses import dataclass, field
 #      real stall on real route data (was scanning each corridor's
 #      full geometry per route point; confirmed ~16x faster on a
 #      6-route/44km real GPX dataset)
+# 9.0  Replaced bottom-up corridor detection/matching with a real
+#      topology graph: nodes at junctions, edges tagged with route
+#      membership, each route an explicit path through the graph
+#      decided once at insertion time - never re-derived by search.
+#      classify_route_sets/materialize_corridors/merge_corridors/
+#      resolve_corridor_equivalence/build_corridor_route_index/
+#      assemble_route_path all replaced by build_route_network() and
+#      assemble_route_path_from_graph(). Confirmed on real 6-route GPX
+#      data: total pipeline time 0.91s (was ~50s pre-grid, ~3.1s
+#      post-grid), and the route pair that still failed to separate at
+#      a junction after every prior fix this cycle (8.3-8.5) now shows
+#      a clean 20m lane separation.
 #
 # =============================================================================
 
 
-VERSION = "8.5"
+VERSION = "9.0"
 
 ENGINE_FEEDBACK = None
 
@@ -266,6 +278,7 @@ def _bind_engine_parameters(parameters):
     global MIN_STABLE_LENGTH, STABILITY_PASSES, MIN_CORRIDOR_LENGTH
     global INDEX_SEARCH_MARGIN
     global LOOP_CLOSURE_TOLERANCE
+    global NODE_MERGE_TOLERANCE, MIN_EDGE_SPLIT_LENGTH
 
     GROUP_NAME = parameters.io.output_group_name
     CORRIDOR_RESULT_NAME = parameters.io.corridor_result_name
@@ -291,6 +304,16 @@ def _bind_engine_parameters(parameters):
     MIN_CORRIDOR_LENGTH = parameters.corridor.min_corridor_length
     INDEX_SEARCH_MARGIN = parameters.corridor.index_search_margin
     LOOP_CLOSURE_TOLERANCE = parameters.corridor.loop_closure_tolerance
+
+    # New for the graph-based topology (route network) rewrite: no
+    # dedicated user-facing parameters yet, deliberately aliased to
+    # existing tolerances that already mean almost the same thing -
+    # MATCH_DISTANCE for "same physical junction" node consolidation,
+    # MIN_CORRIDOR_LENGTH for "don't create a sliver edge fragment" -
+    # can become independent parameters later if real data ever shows
+    # they need to diverge.
+    NODE_MERGE_TOLERANCE = parameters.corridor.match_distance
+    MIN_EDGE_SPLIT_LENGTH = parameters.corridor.min_corridor_length
 
     return parameters
 
@@ -464,11 +487,6 @@ def angle_difference(angle1, angle2):
         difference,
         abs(math.pi - difference)
     )
-
-
-def route_set_key(route_set):
-
-    return tuple(sorted(route_set))
 
 
 def run_length(run, segment_lengths):
@@ -650,23 +668,6 @@ def stabilize_route_sets(
             break
 
     return values, repair_count
-
-
-def corridor_geometry(
-    sampled_points,
-    start_segment,
-    end_segment
-):
-
-    points = sampled_points[
-        start_segment:
-        end_segment + 2
-    ]
-
-    if len(points) < 2:
-        return QgsGeometry()
-
-    return QgsGeometry.fromPolylineXY(points)
 
 
 def offset_polyline_points(points, offset_distance):
@@ -1083,799 +1084,209 @@ def load_routes(routes, project_crs, project):
     return route_lines
 
 
-def build_segment_index(route_lines, project_crs):
+def build_route_graph():
     # ==================================================
-    # SEGMENT SPATIAL INDEX - PERFORMANCE BRANCH
-    # ==================================================
-    debug("")
-    debug("BUILDING SEGMENT INDEX / BYGGER SEGMENT-INDEX")
-    debug("----------------------------------------")
-    segment_index_layer = QgsVectorLayer("LineString?crs=" + project_crs.authid(), "_temporary_segment_index", "memory")
-    segment_index_provider = segment_index_layer.dataProvider()
-    segment_index_provider.addAttributes([QgsField("segment_id", QVariant.Int)])
-    segment_index_layer.updateFields()
-    segment_records = {}
-    segment_features = []
-    next_segment_id = 0
-    for route_line in route_lines:
-        points = route_line["points"]
-        for segment_index in range(len(points) - 1):
-            point1 = points[segment_index]
-            point2 = points[segment_index + 1]
-            geometry = QgsGeometry.fromPolylineXY([point1, point2])
-            segment_records[next_segment_id] = {
-                "route_no": route_line["route_no"],
-                "geometry": geometry,
-                "angle": segment_angle(point1, point2),
-            }
-            feature = QgsFeature(segment_index_layer.fields())
-            feature["segment_id"] = next_segment_id
-            feature.setGeometry(geometry)
-            segment_features.append(feature)
-            next_segment_id += 1
-    segment_index_provider.addFeatures(segment_features)
-    fid_to_segment_id = {feature.id(): int(feature["segment_id"]) for feature in segment_index_layer.getFeatures()}
-    segment_spatial_index = QgsSpatialIndex(segment_index_layer.getFeatures())
-    debug("Index segments / Indekssegmenter:", len(segment_records))
-
-
-    return segment_records, fid_to_segment_id, segment_spatial_index
-
-
-def classify_route_sets(route_lines, segment_records, fid_to_segment_id, segment_spatial_index):
-    # ==================================================
-    # KLASSIFICER ROUTE-SET - GROV KANDIDAT-OPDAGELSE
+    # RUTE-GRAF / ROUTE GRAPH
     #
-    # This only has to find WHERE a route is plausibly travelling
-    # alongside others, not get the exact membership right - two routes
-    # sharing a real stretch can each independently detect a different
-    # (possibly incomplete) subset of who else is there, and that is no
-    # longer a correctness problem. materialize_corridors() below still
-    # only builds one corridor candidate per detected run, from whichever
-    # route happens to be its lowest-numbered member; when the same
-    # physical stretch produces more than one such candidate (because two
-    # routes disagreed about who else was on it), resolve_corridor_
-    # equivalence() is what reconciles that - by geometry, at the
-    # corridor level, taking the union of every equivalent candidate's
-    # routes as the single corrected source of truth. That is a much
-    # safer place to reconcile than here: a corridor is already a long,
-    # continuous, stable run, so merging by whole-corridor coverage can't
-    # bridge two routes that only ever pass near a shared third route at
-    # different, unrelated physical locations - which per-segment
-    # reconciliation (tried and reverted) could and did.
+    # The single source of truth for topology: nodes at junctions,
+    # edges tagged with which routes travel them. Built once via
+    # insert_route_into_graph() for every route, then consolidated via
+    # resolve_node_clusters()/resolve_route_paths() below - after that,
+    # a route's path through the graph is known by construction, never
+    # re-derived by searching the finished graph at render time. This
+    # replaces the old bottom-up design (each route independently
+    # detecting proximity to others, candidate corridors materialized
+    # after the fact, every route re-matching itself against them at
+    # render time) that produced a recurring pattern of junction bugs,
+    # since junctions were never explicit - only approximated by
+    # distance/angle thresholds applied repeatedly at different stages.
     # ==================================================
-    debug("")
-    debug("CLASSIFYING CORRIDORS / KLASSIFICERER KORRIDORER")
-    debug("----------------------------------------")
 
-    classified_lines = []
-    raw_change_count = 0
-    stable_change_count = 0
-    stability_repair_count = 0
-
-    for line_counter, route_line in enumerate(route_lines, start=1):
-
-        points = route_line["points"]
-        segment_lengths = []
-        raw_route_sets = []
-
-        for segment_index in range(len(points) - 1):
-
-            point1 = points[segment_index]
-            point2 = points[segment_index + 1]
-            segment_lengths.append(point_distance(point1, point2))
-
-            segment_geometry = QgsGeometry.fromPolylineXY([point1, point2])
-            angle = segment_angle(point1, point2)
-            search_rectangle = segment_geometry.boundingBox()
-            search_rectangle.grow(INDEX_SEARCH_MARGIN)
-            candidate_fids = segment_spatial_index.intersects(search_rectangle)
-
-            matched_routes = {route_line["route_no"]}
-
-            for candidate_fid in candidate_fids:
-
-                candidate_segment_id = fid_to_segment_id.get(candidate_fid)
-
-                if candidate_segment_id is None:
-                    continue
-
-                candidate = segment_records.get(candidate_segment_id)
-
-                if candidate is None or candidate["route_no"] == route_line["route_no"]:
-                    continue
-
-                if segment_geometry.distance(candidate["geometry"]) > MATCH_DISTANCE:
-                    continue
-
-                if angle_difference(angle, candidate["angle"]) > ANGLE_TOLERANCE:
-                    continue
-
-                matched_routes.add(candidate["route_no"])
-
-            raw_route_sets.append(route_set_key(matched_routes))
-
-        raw_runs = build_runs(raw_route_sets)
-        raw_change_count += max(0, len(raw_runs) - 1)
-
-        stable_route_sets, repairs = stabilize_route_sets(raw_route_sets, segment_lengths)
-        stability_repair_count += repairs
-
-        stable_runs = build_runs(stable_route_sets)
-        stable_change_count += max(0, len(stable_runs) - 1)
-
-        classified_lines.append({
-            "line": route_line,
-            "segment_lengths": segment_lengths,
-            "route_sets": stable_route_sets,
-            "runs": stable_runs
-        })
-
-        debug(
-            "Route-set / Rute-sæt:",
-            route_line["route_no"],
-            "segments", len(stable_route_sets),
-            "stable_route_sets", stable_route_sets,
-            "runs", [list(run) for run in stable_runs]
-        )
-
-        if line_counter % 10 == 0:
-            debug(line_counter, "/", len(route_lines))
-    debug("")
-    debug("Raw route-set transitions / Rå route-set skift:", raw_change_count)
-    debug("Stable route-set transitions / Stabile route-set skift:", stable_change_count)
-    debug("Noise runs repaired / Støj-runs rettet:", stability_repair_count)
+    return {
+        "nodes": {},
+        "edges": {},
+        "live_edge_ids": set(),
+        "superseded_by": {},
+        "next_node_id": 0,
+        "next_edge_id": 0,
+    }
 
 
+def create_node(graph, point):
 
-    return classified_lines, raw_change_count, stable_change_count, stability_repair_count
+    node_id = graph["next_node_id"]
+    graph["next_node_id"] += 1
+    graph["nodes"][node_id] = QgsPointXY(point)
+
+    return node_id
 
 
-def materialize_corridors(classified_lines):
+def create_edge(graph, points, routes, node_a, node_b, created_by_route):
+
+    edge_id = graph["next_edge_id"]
+    graph["next_edge_id"] += 1
+
+    points = [QgsPointXY(point) for point in points]
+
+    graph["edges"][edge_id] = {
+        "points": points,
+        "distances": cumulative_distances(points),
+        "node_a": node_a,
+        "node_b": node_b,
+        "routes": set(routes),
+        "created_by_route": created_by_route,
+    }
+
+    graph["live_edge_ids"].add(edge_id)
+
+    return edge_id
+
+
+def build_live_edge_grid(graph, cell_size):
     # ==================================================
-    # MATERIALIZE CORRIDORS / MATERIALISER KORRIDORER
+    # GITTER OVER LEVENDE KANTER / GRID OVER LIVE EDGES
     #
-    # A corridor is emitted only from the lowest route in its route set.
-    # This selects one original route as the centerline without union,
-    # snapping, or geometric post-processing.
+    # Same technique as build_segment_grid() below, generalized to index
+    # every currently-live edge's segments together in one grid (keyed
+    # by (edge_id, local_segment_index) pairs) - a not-yet-inserted
+    # route can match against ANY live edge, so unlike the old
+    # per-route candidate pre-filtering by route membership, there is no
+    # narrower candidate set to start from here: membership is exactly
+    # what insertion is deciding.
+    # ==================================================
+
+    grid = {}
+
+    for edge_id in graph["live_edge_ids"]:
+
+        points = graph["edges"][edge_id]["points"]
+
+        for index in range(len(points) - 1):
+
+            a = points[index]
+            b = points[index + 1]
+
+            min_cell_x = int(math.floor(min(a.x(), b.x()) / cell_size))
+            max_cell_x = int(math.floor(max(a.x(), b.x()) / cell_size))
+            min_cell_y = int(math.floor(min(a.y(), b.y()) / cell_size))
+            max_cell_y = int(math.floor(max(a.y(), b.y()) / cell_size))
+
+            for cell_x in range(min_cell_x, max_cell_x + 1):
+                for cell_y in range(min_cell_y, max_cell_y + 1):
+                    grid.setdefault((cell_x, cell_y), []).append(
+                        (edge_id, index)
+                    )
+
+    return grid
+
+
+def match_route_segments_to_edges(points, graph, edge_grid):
+    # ==================================================
+    # MATCH RUTE-SEGMENTER TIL LEVENDE KANTER / MATCH ROUTE SEGMENTS TO LIVE EDGES
     #
-    # En korridor udskrives kun fra den laveste rute i
-    # dens route-set. Dermed vælges én original rute som
-    # centerline uden union, snapping eller geometrisk
-    # efterreparation.
+    # Per-segment classification against the CURRENT graph, not other
+    # routes directly - this is what the old bottom-up per-route
+    # detection used to do, replaced here by matching against the
+    # single growing network instead. Angle tolerance (not just
+    # distance) matters: two routes merely crossing at a point, not
+    # running alongside each other, must not be classified as sharing
+    # an edge - the same reasoning the old per-route detection used.
+    # is_beyond_polyline_end() guards against nearest_position_on_
+    # segment()'s clamped projection silently extending an edge's
+    # effective capture zone past its own real end (the same clamping
+    # bug fixed earlier this session for per-point corridor matching -
+    # it applies identically here).
     # ==================================================
 
-    debug("")
-    debug("MATERIALIZING CORRIDORS / MATERIALISERER KORRIDORER")
-    debug("----------------------------------------")
+    matched_edge_id = []
 
-    corridors = []
-    skipped_non_owner = 0
-    skipped_short = 0
+    for index in range(len(points) - 1):
 
-    for classified in classified_lines:
+        point1 = points[index]
+        point2 = points[index + 1]
+        angle = segment_angle(point1, point2)
 
-        route_line = classified["line"]
-        sampled_points = route_line["points"]
+        candidates = set()
+        candidates.update(nearby_segment_indices(point1, edge_grid, MATCH_DISTANCE))
+        candidates.update(nearby_segment_indices(point2, edge_grid, MATCH_DISTANCE))
 
-        for run in classified["runs"]:
-
-            routes_key = run["value"]
-
-            if not routes_key:
-                continue
-
-            owner_route = min(routes_key)
-
-            if route_line["route_no"] != owner_route:
-                skipped_non_owner += 1
-                continue
-
-            geometry = corridor_geometry(
-                sampled_points,
-                run["start"],
-                run["end"]
-            )
-
-            if (
-                geometry.isNull()
-                or geometry.isEmpty()
-                or geometry.length()
-                < MIN_CORRIDOR_LENGTH
-            ):
-                skipped_short += 1
-                continue
-
-            corridors.append(
-                {
-                    "geometry": geometry,
-                    "routes": routes_key,
-                    "route_count": len(routes_key),
-                    "source_route": route_line["route_no"],
-                    "start_seg": run["start"],
-                    "end_seg": run["end"]
-                }
-            )
-
-
-    debug("Raw corridors / Rå korridorer:", len(corridors))
-    debug("Skipped non-owner runs / Ikke-owner runs sprunget over:", skipped_non_owner)
-    debug("Skipped short corridors / Korte korridorer sprunget over:", skipped_short)
-
-    for corridor_id, corridor in enumerate(corridors):
-        first_point = None
-        last_point = None
-
-        if corridor["geometry"].isMultipart():
-            parts = corridor["geometry"].asMultiPolyline()
-            if parts and parts[0]:
-                first_point = QgsPointXY(parts[0][0])
-                last_point = QgsPointXY(parts[0][-1])
-        else:
-            points = corridor["geometry"].asPolyline()
-            if points:
-                first_point = QgsPointXY(points[0])
-                last_point = QgsPointXY(points[-1])
-
-        closed_geom = (
-            first_point is not None
-            and last_point is not None
-            and point_distance(first_point, last_point) < 0.001
-        )
-
-        debug(
-            "CORRIDOR",
-            corridor_id,
-            "source_route",
-            corridor["source_route"],
-            "routes",
-            sorted(corridor["routes"]),
-            "route_count",
-            corridor["route_count"],
-            "length_m",
-            round(corridor["geometry"].length(), 2),
-            "closed_geom",
-            closed_geom,
-            "start_seg",
-            corridor["start_seg"],
-            "end_seg",
-            corridor["end_seg"]
-        )
-
-
-    return corridors
-
-
-def merge_corridors(corridors):
-    # ==================================================
-    # SAMMENKÆD DIREKTE NABO-RUNS
-    #
-    # Kun inden for samme source route og samme route-set.
-    # Kandidatsøgningen er stadig begrænset til den gruppe -
-    # aldrig et generelt nærmeste-nabo-gæt på tværs af corridors.
-    # Men to runs af samme route+route-set må gerne have et reelt,
-    # begrænset endepunktsgab mellem sig (typisk GPS-/digitaliserings-
-    # støj ved en løkkes start/slut-søm), ikke kun floating point-støj.
-    # LOOP_CLOSURE_TOLERANCE styrer hvor stort det gab må være, og er
-    # den samme tolerance som afgør om en rute regnes som lukket i
-    # materialize_route_layers, så de to trin ikke er uenige.
-    # ==================================================
-
-    debug("")
-    debug("MERGING DIRECT CORRIDOR RUNS / SAMMENKÆDER DIREKTE KORRIDOR-RUNS")
-    debug("----------------------------------------")
-
-    merged_corridors = []
-    joined_count = 0
-
-    corridors_sorted = sorted(
-        corridors,
-        key=lambda item: (
-            item["source_route"],
-            item["routes"],
-            item["geometry"].boundingBox().xMinimum(),
-            item["geometry"].boundingBox().yMinimum()
-        )
-    )
-
-
-    def geometry_points(geometry):
-
-        if geometry.isMultipart():
-            parts = geometry.asMultiPolyline()
-
-            if not parts:
-                return []
-
-            points = max(
-                parts,
-                key=lambda part: len(part)
-            )
-        else:
-            points = geometry.asPolyline()
-
-        return [
-            QgsPointXY(point)
-            for point in points
-        ]
-
-
-    unused = set(range(len(corridors_sorted)))
-
-    # Kandidater grupperes kun efter (source_route, routes_key). Selve
-    # matchet afgøres af en reel afstandssammenligning inden for gruppen,
-    # ikke af et hash-baseret koordinatgitter.
-    corridor_points = {}
-    candidates_by_group = {}
-
-    for corridor_id, corridor in enumerate(corridors_sorted):
-
-        points = geometry_points(corridor["geometry"])
-        corridor_points[corridor_id] = points
-
-        if len(points) < 2:
-            continue
-
-        group_key = (corridor["source_route"], corridor["routes"])
-        candidates_by_group.setdefault(group_key, []).append(corridor_id)
-
-
-    def find_join_candidate(group_key, point):
-
-        best_id = None
-        best_endpoint_index = None
+        best_edge_id = None
         best_distance = None
 
-        for candidate_id in candidates_by_group.get(group_key, []):
+        for edge_id, local_index in candidates:
 
-            if candidate_id not in unused:
+            if edge_id not in graph["live_edge_ids"]:
                 continue
 
-            candidate_points = corridor_points[candidate_id]
+            edge = graph["edges"][edge_id]
+            edge_points = edge["points"]
+            a = edge_points[local_index]
+            b = edge_points[local_index + 1]
 
-            if len(candidate_points) < 2:
+            if angle_difference(angle, segment_angle(a, b)) > ANGLE_TOLERANCE:
                 continue
 
-            for endpoint_index, candidate_point in (
-                (0, candidate_points[0]),
-                (1, candidate_points[-1])
-            ):
+            distance_at_a = edge["distances"][local_index]
 
-                distance = point_distance(point, candidate_point)
-
-                if distance > LOOP_CLOSURE_TOLERANCE:
-                    continue
-
-                if (
-                    best_distance is None
-                    or distance < best_distance
-                    or (
-                        distance == best_distance
-                        and candidate_id < best_id
-                    )
-                ):
-                    best_distance = distance
-                    best_id = candidate_id
-                    best_endpoint_index = endpoint_index
-
-        return best_id, best_endpoint_index
-
-
-    def midpoint(point1, point2):
-
-        return QgsPointXY(
-            (point1.x() + point2.x()) / 2.0,
-            (point1.y() + point2.y()) / 2.0
-        )
-
-
-    while unused:
-
-        current_id = min(unused)
-        unused.remove(current_id)
-
-        current = corridors_sorted[current_id]
-
-        chain_points = list(corridor_points[current_id])
-
-        source_route = current["source_route"]
-        routes_key = current["routes"]
-        group_key = (source_route, routes_key)
-
-        extended = True
-
-        while extended:
-
-            extended = False
-
-            # Forsøg først ved slutningen.
-            candidate_id, endpoint_index = find_join_candidate(
-                group_key,
-                chain_points[-1]
+            position1, _, distance1 = nearest_position_on_segment(
+                point1, a, b, distance_at_a
+            )
+            position2, _, distance2 = nearest_position_on_segment(
+                point2, a, b, distance_at_a
             )
 
-            if candidate_id is not None:
+            distance = max(distance1, distance2)
 
-                candidate_points = list(corridor_points[candidate_id])
-
-                if endpoint_index == 1:
-                    candidate_points.reverse()
-
-                # Luk et eventuelt reelt gab i sømmen med ét fælles punkt
-                # i stedet for at lade et lille knæk stå.
-                chain_points[-1] = midpoint(
-                    chain_points[-1],
-                    candidate_points[0]
-                )
-
-                chain_points.extend(candidate_points[1:])
-
-                unused.remove(candidate_id)
-                joined_count += 1
-                extended = True
+            if distance > MATCH_DISTANCE:
                 continue
 
-            # Forsøg derefter ved starten.
-            candidate_id, endpoint_index = find_join_candidate(
-                group_key,
-                chain_points[0]
-            )
-
-            if candidate_id is not None:
-
-                candidate_points = list(corridor_points[candidate_id])
-
-                if endpoint_index == 0:
-                    candidate_points.reverse()
-
-                chain_points[0] = midpoint(
-                    candidate_points[-1],
-                    chain_points[0]
-                )
-
-                chain_points = (
-                    candidate_points[:-1]
-                    + chain_points
-                )
-
-                unused.remove(candidate_id)
-                joined_count += 1
-                extended = True
-
-        merged_geometry = QgsGeometry.fromPolylineXY(
-            chain_points
-        )
-
-        merged_corridors.append(
-            {
-                "geometry": merged_geometry,
-                "routes": routes_key,
-                "route_count": len(routes_key),
-                "source_route": source_route
-            }
-        )
-
-
-    debug("Merges / Sammenkædninger:", joined_count)
-    debug("Final corridors / Endelige korridorer:", len(merged_corridors))
-
-
-
-    return merged_corridors, joined_count
-
-
-def resolve_corridor_equivalence(merged_corridors):
-    # ==================================================
-    # KORRIDOR-EQUIVALENS - TOPOLOGY FIRST
-    #
-    # This is the single source of truth for "which routes actually
-    # share this physical stretch" - not classify_route_sets(). Two
-    # routes' own independent proximity search can each detect a
-    # different (possibly incomplete) subset of who else is on a shared
-    # stretch, since each is only guessing from noisy GPS traces; that
-    # disagreement showed up as materialize_corridors() emitting more
-    # than one corridor candidate for what is really the same physical
-    # road, one per route whose own detection made it the run's owner.
-    #
-    # Equivalence is judged on geometry alone here - NOT on whether the
-    # two candidates' route-sets already agree, which would beg the
-    # question. Two whole corridor candidates are the same physical
-    # stretch if they run close together for (almost) their entire
-    # length; when they are, the union of every equivalent candidate's
-    # routes becomes the corrected, single route-set for that stretch -
-    # every route that actually travels it, regardless of which of them
-    # individually detected which others.
-    #
-    # Judging equivalence on whole, already-continuous corridor
-    # candidates (not on individual raw segments) is what keeps this
-    # safe from over-merging: a candidate only merges with another if it
-    # tracks it closely along (nearly) its whole length, so a route that
-    # only brushes past a shared corridor briefly near a junction, then
-    # diverges, cannot drag unrelated routes on the other side of that
-    # junction into the same group the way segment-level reconciliation
-    # (tried and reverted) could.
-    #
-    # The result is used ONLY for physical lane reference/materialization.
-    # The diagnostic corridor/lane layers keep every raw candidate as
-    # detected, unmodified.
-    # ==================================================
-
-    debug("")
-    debug("FINDING EQUIVALENT CORRIDORS / FINDER ÆKVIVALENTE KORRIDORER")
-    debug("----------------------------------------")
-
-
-    def geometry_sample_points(geometry, spacing):
-
-        sampled = []
-
-        for points in extract_lines(geometry):
-
-            if len(points) < 2:
-                continue
-
-            sampled.extend(
-                resample_line(points, spacing)
-            )
-
-        return sampled
-
-
-    def corridor_overlap_coverage(geometry1, geometry2):
-
-        if geometry1.length() <= geometry2.length():
-            sample_geometry = geometry1
-            target_geometry = geometry2
-        else:
-            sample_geometry = geometry2
-            target_geometry = geometry1
-
-        sample_points = geometry_sample_points(
-            sample_geometry,
-            SAMPLE_DISTANCE
-        )
-
-        if not sample_points:
-            return 0.0
-
-        close_count = 0
-
-        for point in sample_points:
-
-            point_geometry = QgsGeometry.fromPointXY(
-                point
-            )
+            total_length = edge["distances"][-1]
 
             if (
-                point_geometry.distance(target_geometry)
-                <= CORRIDOR_EQUIVALENCE_DISTANCE
-            ):
-                close_count += 1
-
-        return close_count / len(sample_points)
-
-
-    equivalence_parent = list(
-        range(len(merged_corridors))
-    )
-
-
-    def equivalence_find(index):
-
-        while equivalence_parent[index] != index:
-
-            equivalence_parent[index] = (
-                equivalence_parent[
-                    equivalence_parent[index]
-                ]
-            )
-
-            index = equivalence_parent[index]
-
-        return index
-
-
-    def equivalence_union(index1, index2):
-
-        root1 = equivalence_find(index1)
-        root2 = equivalence_find(index2)
-
-        if root1 == root2:
-            return
-
-        if root1 < root2:
-            equivalence_parent[root2] = root1
-        else:
-            equivalence_parent[root1] = root2
-
-
-    equivalence_pair_count = 0
-
-    for index1 in range(len(merged_corridors)):
-
-        corridor1 = merged_corridors[index1]
-
-        for index2 in range(
-            index1 + 1,
-            len(merged_corridors)
-        ):
-
-            corridor2 = merged_corridors[index2]
-
-            distance = corridor1["geometry"].distance(
-                corridor2["geometry"]
-            )
-
-            # Cheap rejection first, before the more expensive coverage
-            # sampling - and before logging, so the debug log only shows
-            # pairs that were genuine candidates.
-            if distance > CORRIDOR_EQUIVALENCE_DISTANCE:
-                continue
-
-            coverage = corridor_overlap_coverage(
-                corridor1["geometry"],
-                corridor2["geometry"]
-            )
-
-            debug(
-                "Corridor overlap / Korridor overlap:",
-                index1,
-                index2,
-                "routes1", corridor1["routes"],
-                "routes2", corridor2["routes"],
-                "distance", round(distance, 3),
-                "coverage", round(coverage, 3)
-            )
-
-            if (
-                coverage
-                < CORRIDOR_EQUIVALENCE_MIN_COVERAGE
+                is_beyond_polyline_end(point1, edge_points, position1, total_length)
+                or is_beyond_polyline_end(point2, edge_points, position2, total_length)
             ):
                 continue
 
-            equivalence_union(
-                index1,
-                index2
-            )
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_edge_id = edge_id
 
-            equivalence_pair_count += 1
+        matched_edge_id.append(best_edge_id)
 
+    return matched_edge_id
 
-    equivalence_groups = {}
-
-    for corridor_index in range(
-        len(merged_corridors)
-    ):
-
-        root_index = equivalence_find(
-            corridor_index
-        )
-
-        equivalence_groups.setdefault(
-            root_index,
-            []
-        ).append(
-            corridor_index
-        )
-
-
-    canonical_corridor_by_index = {}
-    corridor_routes_by_canonical_index = {}
-
-    for group_indices in equivalence_groups.values():
-
-        canonical_index = max(
-            group_indices,
-            key=lambda corridor_index: (
-                merged_corridors[
-                    corridor_index
-                ]["geometry"].length(),
-                -corridor_index
-            )
-        )
-
-        for corridor_index in group_indices:
-
-            canonical_corridor_by_index[
-                corridor_index
-            ] = canonical_index
-
-        # The corrected route-set for this physical stretch: every route
-        # that any equivalent candidate detected, not just whichever
-        # candidate happened to become canonical - this is what actually
-        # fixes routes disagreeing about who else shares a stretch,
-        # rather than just picking one route's (possibly incomplete)
-        # side of the disagreement.
-        unioned_routes = set()
-
-        for corridor_index in group_indices:
-            unioned_routes.update(
-                merged_corridors[corridor_index]["routes"]
-            )
-
-        corridor_routes_by_canonical_index[canonical_index] = route_set_key(
-            unioned_routes
-        )
-
-
-    equivalent_groups = [
-        group_indices
-        for group_indices in equivalence_groups.values()
-        if len(group_indices) > 1
-    ]
-
-    debug(
-        "Equivalent corridor pairs / Ækvivalente corridor-par:",
-        equivalence_pair_count
-    )
-
-    debug(
-        "Equivalence groups with duplicates / Ækvivalensgrupper med dubletter:",
-        len(equivalent_groups)
-    )
-
-    for group_indices in equivalent_groups:
-
-        canonical_index = (
-            canonical_corridor_by_index[
-                group_indices[0]
-            ]
-        )
-
-        debug(
-            "corrected routes",
-            ",".join(
-                str(route_no)
-                for route_no in corridor_routes_by_canonical_index[
-                    canonical_index
-                ]
-            ),
-            "→ corridors",
-            ",".join(
-                str(index + 1)
-                for index in group_indices
-            ),
-            "| canonical:",
-            canonical_index + 1
-        )
-
-
-
-    return canonical_corridor_by_index, corridor_routes_by_canonical_index
-
-
-def smooth_corridor_centerlines(merged_corridors):
+def smooth_edge_centerlines(graph):
     # ==================================================
-    # UDJÆVN CORRIDOR-CENTERLINJER / SMOOTH CORRIDOR CENTERLINES
+    # UDJÆVN KANT-CENTERLINJER / SMOOTH EDGE CENTERLINES
     #
-    # Every lane offset from a corridor shares this one geometry, so
-    # smoothing it once here - removing sub-cartographic GPS/receiver
-    # noise before any lane is ever derived from it - replaces smoothing
-    # (or patching around) that noise independently on every lane
-    # downstream.
+    # Every lane offset from an edge shares this one geometry, so
+    # smoothing it once here - after the graph is fully built and
+    # consolidated, right before rendering - replaces smoothing (or
+    # patching around) GPS/receiver noise independently on every lane
+    # downstream. Distances are recomputed since smoothing shifts point
+    # positions; moving_average_smooth_points() leaves endpoints
+    # unchanged, so a smoothed edge's ends still coincide exactly with
+    # its node's stored coordinate.
     # ==================================================
 
     if CENTERLINE_SMOOTHING_WINDOW <= 0:
-        return merged_corridors
+        return
 
-    for corridor in merged_corridors:
+    for edge_id in graph["live_edge_ids"]:
 
-        parts = extract_lines(corridor["geometry"])
+        edge = graph["edges"][edge_id]
+        points = edge["points"]
 
-        if not parts or len(parts[0]) < 3:
+        if len(points) < 3:
             continue
 
         smoothed_points = moving_average_smooth_points(
-            parts[0],
-            CENTERLINE_SMOOTHING_WINDOW
+            points, CENTERLINE_SMOOTHING_WINDOW
         )
 
-        corridor["geometry"] = QgsGeometry.fromPolylineXY(
-            smoothed_points
-        )
-
-    return merged_corridors
-
+        edge["points"] = smoothed_points
+        edge["distances"] = cumulative_distances(smoothed_points)
 
 def nearest_position_on_segment(point, a, b, distance_at_a):
     # ==================================================
@@ -2056,182 +1467,444 @@ def nearby_segment_indices(point, grid, cell_size):
     return candidates
 
 
-def build_corridor_route_index(merged_corridors, canonical_corridor_by_index, corridor_routes_by_canonical_index):
+def split_edge_at_positions(graph, edge_id, split_positions):
     # ==================================================
-    # CORRIDOR-OPSLAG / CORRIDOR LOOKUP
+    # DEL KANT VED POSITIONER / SPLIT EDGE AT POSITIONS
     #
-    # Precomputes, once, what match_run_to_corridor() needs to look
-    # candidates up cheaply per route: which canonical corridors this
-    # specific route is a member of, per the CORRECTED route-set from
-    # resolve_corridor_equivalence() - not the possibly-incomplete set
-    # this route's own classify_route_sets() run happened to detect - and
-    # each corridor's own points/arc-length distances computed once
-    # rather than on every query. Only canonical corridors are indexed,
-    # so every route sharing a corridor is matched to the same single
-    # geometry even if that physical stretch was independently detected
-    # more than once.
+    # split_positions are arc-length positions strictly inside (0, total
+    # length) - MIN_EDGE_SPLIT_LENGTH snapping is already applied by the
+    # caller (resolve_on_edge_run), so every position here represents a
+    # genuine new junction, never a near-zero sliver. Registers the
+    # fragment chain in superseded_by so any route that already recorded
+    # a step against edge_id can be resolved to the correct fragment(s)
+    # in one generic final pass (resolve_route_paths) - never a special
+    # case at split time.
     # ==================================================
 
-    corridors_by_route_no = {}
-    corridor_cache = {}
-    corridor_routes = {}
+    edge = graph["edges"][edge_id]
+    points = edge["points"]
+    distances = edge["distances"]
+    total_length = distances[-1]
+    routes = edge["routes"]
+    created_by_route = edge["created_by_route"]
+    node_a = edge["node_a"]
+    node_b = edge["node_b"]
 
-    for corridor_index, corridor in enumerate(merged_corridors):
+    boundaries = [0.0] + sorted(split_positions) + [total_length]
 
-        canonical_index = canonical_corridor_by_index.get(
-            corridor_index,
-            corridor_index
+    fragment_ids = []
+    fragment_ranges = []
+    previous_node = node_a
+
+    for index in range(len(boundaries) - 1):
+
+        start_position = boundaries[index]
+        end_position = boundaries[index + 1]
+
+        if index == len(boundaries) - 2:
+            end_node = node_b
+        else:
+            end_node = create_node(
+                graph,
+                interpolate_point(points, distances, end_position)
+            )
+
+        fragment_points = extract_polyline_subrange(
+            points, distances, start_position, end_position
         )
 
-        if canonical_index != corridor_index:
-            continue
-
-        parts = extract_lines(corridor["geometry"])
-
-        if not parts or len(parts[0]) < 2:
-            continue
-
-        points = [QgsPointXY(point) for point in parts[0]]
-        distances = cumulative_distances(points)
-
-        # Grown by MATCH_DISTANCE so a point that's genuinely within
-        # tolerance of the corridor can never fall just outside its own
-        # bounding box - a cheap pre-filter to skip corridors nowhere
-        # near a route entirely, before even touching its segment grid.
-        bounding_box = corridor["geometry"].boundingBox()
-        bounding_box.grow(MATCH_DISTANCE)
-
-        # cell_size == MATCH_DISTANCE: nearby_segment_indices()'s 3x3
-        # neighbourhood search relies on the query radius never
-        # exceeding one cell.
-        grid_cell_size = MATCH_DISTANCE
-        segment_grid = build_segment_grid(points, grid_cell_size)
-
-        corridor_cache[corridor_index] = {
-            "points": points,
-            "distances": distances,
-            "bounding_box": bounding_box,
-            "grid": segment_grid,
-            "grid_cell_size": grid_cell_size,
-        }
-
-        routes = corridor_routes_by_canonical_index.get(
-            canonical_index,
-            corridor["routes"]
+        fragment_id = create_edge(
+            graph,
+            fragment_points,
+            set(routes),
+            previous_node,
+            end_node,
+            created_by_route
         )
 
-        corridor_routes[corridor_index] = routes
+        fragment_ids.append(fragment_id)
+        fragment_ranges.append((start_position, end_position))
+        previous_node = end_node
 
-        for route_no in routes:
-            corridors_by_route_no.setdefault(route_no, []).append(corridor_index)
+    graph["superseded_by"][edge_id] = fragment_ids
+    graph["live_edge_ids"].discard(edge_id)
 
-    return {
-        "corridors_by_route_no": corridors_by_route_no,
-        "corridor_cache": corridor_cache,
-        "corridor_routes": corridor_routes,
+    return fragment_ids, fragment_ranges
+
+
+def resolve_on_edge_run(graph, edge_id, run_start_point, run_end_point):
+    # ==================================================
+    # LØS RUN MOD EKSISTERENDE KANT / RESOLVE RUN AGAINST EXISTING EDGE
+    #
+    # Determines exactly which (possibly newly split) fragment of
+    # edge_id this run corresponds to, and this run's direction of
+    # travel along it - the same projection match_run_to_corridor() used
+    # to do, but now DECIDING the graph's structure (whether a split is
+    # needed) instead of just reading a reference to offset from.
+    # Exhaustive nearest_position_on_polyline() is fine here - called at
+    # most twice per run, not once per point, so its O(edge points) cost
+    # is never the bottleneck the per-point case was.
+    # ==================================================
+
+    edge = graph["edges"][edge_id]
+    points = edge["points"]
+    distances = edge["distances"]
+    total_length = distances[-1]
+
+    position_start, _, _ = nearest_position_on_polyline(
+        run_start_point, points, distances
+    )
+    position_end, _, _ = nearest_position_on_polyline(
+        run_end_point, points, distances
+    )
+
+    direction = 1 if position_start <= position_end else -1
+    low_position = min(position_start, position_end)
+    high_position = max(position_start, position_end)
+
+    split_positions = []
+
+    if low_position > MIN_EDGE_SPLIT_LENGTH:
+        split_positions.append(low_position)
+
+    if high_position < total_length - MIN_EDGE_SPLIT_LENGTH:
+        split_positions.append(high_position)
+
+    if not split_positions:
+
+        fragment_id = edge_id
+        fragment_node_a = edge["node_a"]
+        fragment_node_b = edge["node_b"]
+
+    else:
+
+        fragment_ids, fragment_ranges = split_edge_at_positions(
+            graph, edge_id, split_positions
+        )
+
+        midpoint = (low_position + high_position) / 2.0
+        fragment_id = fragment_ids[0]
+
+        for candidate_id, (range_start, range_end) in zip(fragment_ids, fragment_ranges):
+            if range_start <= midpoint <= range_end:
+                fragment_id = candidate_id
+                break
+
+        fragment = graph["edges"][fragment_id]
+        fragment_node_a = fragment["node_a"]
+        fragment_node_b = fragment["node_b"]
+
+    if direction == 1:
+        entry_node = fragment_node_a
+        exit_node = fragment_node_b
+    else:
+        entry_node = fragment_node_b
+        exit_node = fragment_node_a
+
+    return entry_node, exit_node, fragment_id, direction
+
+
+def insert_route_into_graph(graph, route_line, edge_grid):
+    # ==================================================
+    # INDSÆT RUTE I GRAF / INSERT ROUTE INTO GRAPH
+    #
+    # Classifies this route's own segments against the graph as it
+    # stands at the start of this call (edge_grid is a snapshot),
+    # stabilizes that per-segment signal exactly like the old
+    # classify_route_sets() did (a genuinely noisy GPS-trace-scale
+    # signal - reusing stabilize_route_sets()'s repair pass here is the
+    # same situation it was designed for, unlike the old per-point
+    # corridor-matching case where reusing it was proven wrong), then
+    # walks the resulting runs in order, creating/extending/splitting
+    # edges and recording this route's path through the graph as it
+    # goes. previous_exit_node is carried from one run to the next so
+    # consecutive off-network edges this SAME route creates connect at
+    # one shared node by construction - no tolerance check needed for
+    # that specific case, since it's the same physical point by
+    # construction. Any other node coincidence (this route's own
+    # boundary vs. a DIFFERENT route's independently-created node at the
+    # same physical junction) is deliberately NOT reconciled here - that
+    # is resolve_node_clusters()'s job, once, by geometry, after every
+    # route has been inserted.
+    # ==================================================
+
+    route_no = route_line["route_no"]
+    points = route_line["points"]
+
+    matched_edge_id = match_route_segments_to_edges(points, graph, edge_grid)
+
+    segment_lengths = [
+        point_distance(points[index], points[index + 1])
+        for index in range(len(points) - 1)
+    ]
+
+    raw_values = [
+        (matched_edge_id[index],) if matched_edge_id[index] is not None else ()
+        for index in range(len(matched_edge_id))
+    ]
+
+    stable_values, _ = stabilize_route_sets(raw_values, segment_lengths)
+    runs = build_runs(stable_values)
+
+    path_steps = []
+    previous_exit_node = None
+
+    for run in runs:
+
+        run_points = points[run["start"]: run["end"] + 2]
+
+        if len(run_points) < 2:
+            continue
+
+        if not run["value"]:
+
+            start_node = (
+                previous_exit_node
+                if previous_exit_node is not None
+                else create_node(graph, run_points[0])
+            )
+            end_node = create_node(graph, run_points[-1])
+
+            new_edge_id = create_edge(
+                graph, run_points, {route_no}, start_node, end_node, route_no
+            )
+
+            path_steps.append((new_edge_id, 1))
+            previous_exit_node = end_node
+
+            continue
+
+        edge_id = run["value"][0]
+
+        if edge_id not in graph["live_edge_ids"]:
+            # Already split by an EARLIER run within this SAME route's
+            # own insertion - only possible if this route's own path
+            # revisits the same original edge twice (self-overlap
+            # territory, explicitly out of scope for v1). Falling back
+            # to a fresh off-network edge avoids resolving against a
+            # stale, already-superseded edge, which could otherwise
+            # corrupt the graph with an orphaned double-split. This is a
+            # documented limitation, not a silent bug: both visits still
+            # render (at whatever lane each independently resolves to),
+            # they just won't share fragment identity with each other.
+            start_node = (
+                previous_exit_node
+                if previous_exit_node is not None
+                else create_node(graph, run_points[0])
+            )
+            end_node = create_node(graph, run_points[-1])
+
+            new_edge_id = create_edge(
+                graph, run_points, {route_no}, start_node, end_node, route_no
+            )
+
+            path_steps.append((new_edge_id, 1))
+            previous_exit_node = end_node
+
+            continue
+
+        entry_node, exit_node, fragment_id, direction = resolve_on_edge_run(
+            graph, edge_id, run_points[0], run_points[-1]
+        )
+
+        graph["edges"][fragment_id]["routes"].add(route_no)
+        path_steps.append((fragment_id, direction))
+        previous_exit_node = exit_node
+
+    return path_steps
+
+
+def resolve_node_clusters(graph):
+    # ==================================================
+    # SAMMENFLET NODE-KLYNGER / CONSOLIDATE NODE CLUSTERS
+    #
+    # Nodes are created freely during insertion (a fresh node per
+    # off-network edge endpoint, or per split point), so the SAME
+    # physical junction can end up as several distinct node objects -
+    # one route's own approach point may differ by a few meters from
+    # another route's independently-projected split point. Consolidated
+    # here, once, by geometry - the same union-find-by-distance
+    # principle already trusted for corridor equivalence - rather than
+    # trying to greedily reuse nodes during insertion, which can drift
+    # (two nodes each within tolerance of a shared approach point, but
+    # not of each other).
+    # ==================================================
+
+    node_ids = list(graph["nodes"].keys())
+    parent = {node_id: node_id for node_id in node_ids}
+
+    def find(node_id):
+        while parent[node_id] != node_id:
+            parent[node_id] = parent[parent[node_id]]
+            node_id = parent[node_id]
+        return node_id
+
+    def union(node_id_1, node_id_2):
+        root1 = find(node_id_1)
+        root2 = find(node_id_2)
+        if root1 == root2:
+            return
+        if root1 < root2:
+            parent[root2] = root1
+        else:
+            parent[root1] = root2
+
+    cell_size = NODE_MERGE_TOLERANCE
+    node_grid = {}
+
+    for node_id in node_ids:
+        point = graph["nodes"][node_id]
+        cell = (
+            int(math.floor(point.x() / cell_size)),
+            int(math.floor(point.y() / cell_size))
+        )
+        node_grid.setdefault(cell, []).append(node_id)
+
+    merge_count = 0
+
+    for node_id in node_ids:
+
+        point = graph["nodes"][node_id]
+        cell_x = int(math.floor(point.x() / cell_size))
+        cell_y = int(math.floor(point.y() / cell_size))
+
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for other_id in node_grid.get((cell_x + dx, cell_y + dy), ()):
+
+                    if other_id <= node_id:
+                        continue
+
+                    other_point = graph["nodes"][other_id]
+
+                    if point_distance(point, other_point) <= NODE_MERGE_TOLERANCE:
+                        union(node_id, other_id)
+                        merge_count += 1
+
+    canonical_by_node = {node_id: find(node_id) for node_id in node_ids}
+
+    for edge in graph["edges"].values():
+        edge["node_a"] = canonical_by_node[edge["node_a"]]
+        edge["node_b"] = canonical_by_node[edge["node_b"]]
+
+    canonical_ids = set(canonical_by_node.values())
+    graph["nodes"] = {
+        node_id: graph["nodes"][node_id] for node_id in canonical_ids
     }
 
+    return merge_count
 
-def match_run_to_corridor(corridor_index_data, route_no, run_start, run_end):
+
+def resolve_route_paths(graph, route_path_steps):
     # ==================================================
-    # MATCH RUTE-RUN TIL CORRIDOR / MATCH ROUTE RUN TO CORRIDOR
+    # LØS RUTE-STIER / RESOLVE ROUTE PATHS
     #
-    # Given a route's own run (its start/end points) and the route's own
-    # number, finds the single canonical corridor this route belongs to
-    # at this physical location - per the corrected topology, not this
-    # route's own local guess about who else is on it. Candidates are
-    # every canonical corridor this route is a member of anywhere in the
-    # network; disambiguating between more than one (the same route can
-    # of course share different corridors at different points along its
-    # length) is by picking whichever is spatially closest to this run -
-    # and the result is just the sub-range of that corridor's geometry
-    # this run actually covers, oriented to match this run's own travel
-    # direction.
+    # Each route's steps were recorded live during its own insertion,
+    # and may reference an edge_id that a LATER route's insertion went
+    # on to split. superseded_by chains are followed here, once, for
+    # every route, after all insertions are done - this is the only
+    # place a route's final path is derived from anything other than
+    # what its own insertion directly produced.
+    #
+    # Direction matters through the chain: superseded_by lists a split
+    # edge's fragments in its own original node_a->node_b order, so a
+    # step recorded with direction -1 must walk that list REVERSED, with
+    # each fragment's own direction flipped too - getting this backwards
+    # would silently reverse a fragment's point order without reversing
+    # its direction flag, producing a plausible-looking kink instead of
+    # a crash. Fragment ids are always new/increasing, so this
+    # recursion is a DAG by construction - no cycle guard needed.
+    #
+    # A route revisiting the same edge in its own, separate, later run
+    # needs no special case here: this function only ever reads edge_id
+    # values and the superseded_by map, never which route or which
+    # insertion pass created either.
     # ==================================================
 
-    candidates = corridor_index_data["corridors_by_route_no"].get(
-        route_no,
-        []
-    )
+    def resolve_step(edge_id, direction):
 
-    if not candidates:
-        return None
+        if edge_id in graph["live_edge_ids"]:
+            return [(edge_id, direction)], 0
 
-    corridor_cache = corridor_index_data["corridor_cache"]
+        fragment_ids = graph["superseded_by"][edge_id]
+        ordered_ids = fragment_ids if direction == 1 else list(reversed(fragment_ids))
 
-    best_corridor_index = None
-    best_score = None
-    best_start_position = None
-    best_end_position = None
+        resolved = []
+        max_depth = 0
 
-    for corridor_index in candidates:
+        for fragment_id in ordered_ids:
+            sub_steps, sub_depth = resolve_step(fragment_id, direction)
+            resolved.extend(sub_steps)
+            max_depth = max(max_depth, sub_depth + 1)
 
-        cached = corridor_cache.get(corridor_index)
+        return resolved, max_depth
 
-        if cached is None:
-            continue
+    resolved_paths = {}
+    max_chain_depth = 0
 
-        start_position, start_point, start_distance = (
-            nearest_position_on_polyline(
-                run_start,
-                cached["points"],
-                cached["distances"]
-            )
+    for route_no, steps in route_path_steps.items():
+
+        resolved_steps = []
+
+        for edge_id, direction in steps:
+            sub_steps, depth = resolve_step(edge_id, direction)
+            resolved_steps.extend(sub_steps)
+            max_chain_depth = max(max_chain_depth, depth)
+
+        resolved_paths[route_no] = resolved_steps
+
+    return resolved_paths, max_chain_depth
+
+
+def build_route_network(route_lines):
+    # ==================================================
+    # BYG RUTE-NETVÆRK / BUILD ROUTE NETWORK
+    #
+    # Top-level orchestrator: inserts every route into one growing graph
+    # in a fixed, deterministic order - ascending route_no, independent
+    # of input layer order, so unchanged input always gives an identical
+    # result (sequential incremental matching is not fully order-
+    # independent in pathological cases, unlike the old whole-geometry
+    # corridor-equivalence check, so this determinism is deliberate, not
+    # incidental) - then runs the two consolidation passes and smooths
+    # every final edge's centerline once. After this,
+    # assemble_route_path_from_graph() only ever reads the graph - it
+    # never searches it.
+    # ==================================================
+
+    debug("")
+    debug("BUILDING ROUTE NETWORK / BYGGER RUTE-NETVÆRK")
+    debug("----------------------------------------")
+
+    graph = build_route_graph()
+    route_path_steps = {}
+
+    for route_line in sorted(route_lines, key=lambda line: line["route_no"]):
+
+        edge_grid = build_live_edge_grid(graph, MATCH_DISTANCE)
+        route_path_steps[route_line["route_no"]] = insert_route_into_graph(
+            graph, route_line, edge_grid
         )
-        end_position, end_point, end_distance = (
-            nearest_position_on_polyline(
-                run_end,
-                cached["points"],
-                cached["distances"]
-            )
-        )
 
-        if start_position is None or end_position is None:
-            continue
+    node_cluster_merges = resolve_node_clusters(graph)
+    resolved_paths, max_chain_depth = resolve_route_paths(graph, route_path_steps)
+    smooth_edge_centerlines(graph)
 
-        # A corridor this route is nowhere near must not get matched
-        # just because the route is nominally listed as one of its
-        # members somewhere else in the network - that would silently
-        # offset this run from an unrelated physical location. MATCH_
-        # DISTANCE is already the established "is this really the same
-        # feature" bound used for cross-route matching in classify_
-        # route_sets.
-        if start_distance > MATCH_DISTANCE or end_distance > MATCH_DISTANCE:
-            continue
-
-        score = start_distance + end_distance
-
-        if best_score is None or score < best_score:
-            best_score = score
-            best_corridor_index = corridor_index
-            best_start_position = start_position
-            best_end_position = end_position
-
-    if best_corridor_index is None:
-        return None
-
-    cached = corridor_cache[best_corridor_index]
-
-    sub_range_points = extract_polyline_subrange(
-        cached["points"],
-        cached["distances"],
-        best_start_position,
-        best_end_position
-    )
-
-    if len(sub_range_points) < 2:
-        return None
-
-    route_numbers = sorted(
-        corridor_index_data["corridor_routes"][best_corridor_index]
-    )
-
-    return {
-        "corridor_index": best_corridor_index,
-        "points": sub_range_points,
-        "route_numbers": route_numbers,
+    stats = {
+        "node_count": len(graph["nodes"]),
+        "edge_count": len(graph["live_edge_ids"]),
+        "split_count": len(graph["superseded_by"]),
+        "max_supersede_chain_depth": max_chain_depth,
+        "node_cluster_merges": node_cluster_merges,
     }
 
+    debug("Nodes / Noder:", stats["node_count"])
+    debug("Live edges / Levende kanter:", stats["edge_count"])
+    debug("Edge splits / Kant-opdelinger:", stats["split_count"])
+    debug("Max supersede-chain depth / Maks supersede-kæde-dybde:", stats["max_supersede_chain_depth"])
+    debug("Node cluster merges / Node-klynge-sammenlægninger:", stats["node_cluster_merges"])
+
+    return graph, resolved_paths, stats
 
 def point_within_bounding_box(point, bounding_box):
 
@@ -2277,223 +1950,45 @@ def is_beyond_polyline_end(point, polyline_points, position, total_length):
     return False
 
 
-def match_route_points_to_corridors(points, route_no, corridor_index_data):
+def assemble_route_path_from_graph(graph, route_no, resolved_path):
     # ==================================================
-    # MATCH RUTE-PUNKTER TIL CORRIDORER LANGS RUTEN
+    # SAMMENSÆT RUTE-STRÆKNING FRA GRAF / ASSEMBLE ROUTE PATH FROM GRAPH
     #
-    # For every point along this route's own path, finds which corridor
-    # (if any) this route is a member of - per the corrected topology
-    # from resolve_corridor_equivalence(), not this route's own
-    # classify_route_sets() guess - AND is physically near right there.
-    # This is what determines run boundaries for assemble_route_path()
-    # below directly and continuously from the topology, instead of
-    # trusting classify_route_sets()'s own per-route runs to even notice
-    # a stretch is shared in the first place: a route's own detection can
-    # fail to flag sharing at all (not just get the membership wrong), in
-    # which case nothing ever consulted the corrected topology for it,
-    # however correct that topology already was - the actual remaining
-    # gap after the topology-first rewrite.
+    # The route's path through the network is already known (resolved
+    # once, in resolve_route_paths()) - this just stitches each
+    # fragment's (possibly reversed) points and computes its lane offset
+    # from route membership alone, never from travel direction:
+    # offset_polyline_points_varying()'s normal-from-tangent already
+    # cancels a reversed travel direction on its own (confirmed by
+    # test_opposite_direction.py) - adding a direction-based sign
+    # correction here would double-flip it.
     #
-    # Two filters keep this affordable at real route/corridor sizes:
-    # a corridor's own bounding box (grown by MATCH_DISTANCE, precomputed
-    # in build_corridor_route_index()) skips corridors nowhere near this
-    # point at all, and its per-corridor segment grid (also precomputed)
-    # then finds only the handful of segments actually near the point,
-    # instead of nearest_position_on_polyline()'s full scan over every
-    # segment. A long, winding corridor's overall bounding box alone is a
-    # poor filter - it can cover a lot of empty area a looping trail never
-    # actually runs through - so without the grid, points that pass the
-    # box check still triggered a full-length scan; confirmed directly
-    # against real GPX data (six real routes, corridors up to 2200+
-    # points): assemble_route_path took 6-15 seconds PER ROUTE before this
-    # grid existed, which is why real runs against real data-sized input
-    # appeared to hang rather than just run a bit slow.
+    # Unlike the old assemble_route_path(), there is no "corridor not
+    # found, fall back to raw points" branch: every stretch of every
+    # route is represented by exactly one graph edge by construction, so
+    # there is nothing left to fall back to.
     # ==================================================
-
-    candidates = corridor_index_data["corridors_by_route_no"].get(route_no, [])
-    corridor_cache = corridor_index_data["corridor_cache"]
-
-    matched_corridor = []
-
-    for point in points:
-
-        best_corridor_index = None
-        best_distance = None
-
-        for corridor_index in candidates:
-
-            cached = corridor_cache.get(corridor_index)
-
-            if cached is None:
-                continue
-
-            if not point_within_bounding_box(point, cached["bounding_box"]):
-                continue
-
-            best_segment_distance = None
-            best_segment_position = None
-
-            for segment_index in nearby_segment_indices(
-                point, cached["grid"], cached["grid_cell_size"]
-            ):
-
-                position, _, distance = nearest_position_on_segment(
-                    point,
-                    cached["points"][segment_index],
-                    cached["points"][segment_index + 1],
-                    cached["distances"][segment_index]
-                )
-
-                if (
-                    best_segment_distance is None
-                    or distance < best_segment_distance
-                ):
-                    best_segment_distance = distance
-                    best_segment_position = position
-
-            if best_segment_distance is None or best_segment_distance > MATCH_DISTANCE:
-                continue
-
-            if is_beyond_polyline_end(
-                point, cached["points"], best_segment_position, cached["distances"][-1]
-            ):
-                continue
-
-            if best_distance is None or best_segment_distance < best_distance:
-                best_distance = best_segment_distance
-                best_corridor_index = corridor_index
-
-        matched_corridor.append(best_corridor_index)
-
-    return matched_corridor
-
-
-def assemble_route_path(classified_line, corridor_index_data):
-    # ==================================================
-    # SAMMENSÆT RUTE-STRÆKNING FRA TOPOLOGI / ASSEMBLE ROUTE PATH FROM TOPOLOGY
-    #
-    # Run boundaries come from match_route_points_to_corridors() above -
-    # which corridor (if any) this route is a member of AND physically
-    # near, checked continuously along its own points - not from
-    # classify_route_sets()'s own runs. build_runs() alone groups this
-    # per-point corridor-identity sequence into runs (wrapped as
-    # single-element tuples, or an empty tuple for "no corridor here").
-    # stabilize_route_sets()'s repair pass is deliberately NOT used here:
-    # it exists to smooth GPS-noise-scale flicker in classify_route_sets()'s
-    # own per-route classification, where a short run really is ambiguous
-    # noise. Here a short run right at a corridor's boundary is not noise -
-    # it is this route's own path genuinely continuing past the corridor's
-    # detected end - and running the repair pass on it merges that boundary
-    # signal into the adjacent corridor-matched run, silently re-extending
-    # the match past the corridor's real geometry (confirmed directly: this
-    # was the exact cause of the assembled path getting truncated to the
-    # corridor's own extent instead of the route's true endpoints).
-    #
-    # For each run, this either takes the route's own points (unshared
-    # stretches, or a shared guess with no real corridor match -
-    # lane_index 0, nothing to offset from) or the matching corridor's
-    # own (smoothed, canonical) sub-range plus this route's lane_index
-    # within it (shared stretches). The result is one continuous point
-    # sequence with a parallel per-point target offset distance - built
-    # once, directly from the topology, never searched for point-by-
-    # point afterwards.
-    #
-    # lane_index is used as-is regardless of whether this run travels the
-    # same or the opposite direction along a shared corridor as another
-    # route sharing it (e.g. two named routes sharing an access road as
-    # part of loops that run opposite ways) - no direction-based sign
-    # correction is applied. Verified directly: offset_polyline_points'
-    # normal is a 90-degree rotation of the local tangent, so a reversed
-    # travel direction already negates the normal on its own: the two
-    # effects cancel out and both routes land on the same physical side
-    # without any extra correction. Adding one here would double-flip
-    # and put them on mismatched sides instead - confirmed by test,
-    # not just reasoned about, since intuition first suggested the
-    # opposite here and was wrong.
-    # ==================================================
-
-    route_line = classified_line["line"]
-    route_no = route_line["route_no"]
-    points = route_line["points"]
-
-    matched_corridor = match_route_points_to_corridors(
-        points, route_no, corridor_index_data
-    )
-
-    # A segment counts as "on corridor C" only if BOTH its endpoints are
-    # matched to C - using only the start point's match would shift the
-    # detected corridor boundary by one whole segment past the corridor's
-    # true end (confirmed directly: a route continuing straight past a
-    # corridor's real end was getting its final approach segment - whose
-    # start point is still the corridor's own last point - misclassified
-    # as "on the corridor", stretching match_run_to_corridor's query past
-    # the corridor's real geometry and truncating the assembled path to
-    # the corridor's own extent instead of the route's true endpoints).
-    raw_values = [
-        (matched_corridor[index],)
-        if (
-            matched_corridor[index] is not None
-            and matched_corridor[index] == matched_corridor[index + 1]
-        )
-        else ()
-        for index in range(len(points) - 1)
-    ]
-
-    # No stabilize_route_sets() here, deliberately: its MIN_STABLE_LENGTH
-    # repair pass exists to smooth GPS-noise-scale flicker in the OLD
-    # per-route pairwise route-set classification, where a short run was
-    # ambiguous noise to be reconciled with a neighbour. Here a short run
-    # right at a corridor's boundary is not noise - it is the exact signal
-    # that this route's own path continues past the corridor's real
-    # extent. Running the repair pass on this data silently merged that
-    # boundary run into the corridor-matched run next to it, undoing the
-    # is_beyond_polyline_end() fix and truncating the assembled path back
-    # to the corridor's own extent (confirmed directly: repair_count == 2
-    # for this exact scenario). build_runs() alone just groups consecutive
-    # equal values with no repair, which is what this per-point,
-    # already-precise proximity signal needs.
-    runs = build_runs(raw_values)
 
     assembled_points = []
     assembled_offsets = []
 
-    for run in runs:
+    for edge_id, direction in resolved_path:
 
-        run_points = points[run["start"]: run["end"] + 2]
+        edge = graph["edges"][edge_id]
+        edge_points = edge["points"]
 
-        if len(run_points) < 2:
-            continue
-
-        piece_points = None
-        lane_index = 0.0
-
-        if run["value"]:
-
-            match = match_run_to_corridor(
-                corridor_index_data,
-                route_no,
-                run_points[0],
-                run_points[-1]
-            )
-
-            if match is not None:
-                piece_points = match["points"]
-                route_numbers = match["route_numbers"]
-                lane_center = (len(route_numbers) - 1) / 2.0
-                lane_index = (
-                    route_numbers.index(route_no) - lane_center
-                )
-
-        if piece_points is None:
-            # Either a genuinely unshared stretch, or a shared route-set
-            # whose corridor was never materialized (e.g. filtered out
-            # for being too short) - either way, fall back to this
-            # route's own points, unoffset.
-            piece_points = [QgsPointXY(point) for point in run_points]
-            lane_index = 0.0
+        piece_points = (
+            [QgsPointXY(point) for point in edge_points]
+            if direction == 1
+            else [QgsPointXY(point) for point in reversed(edge_points)]
+        )
 
         if len(piece_points) < 2:
             continue
+
+        route_numbers = sorted(edge["routes"])
+        lane_center = (len(route_numbers) - 1) / 2.0
+        lane_index = route_numbers.index(route_no) - lane_center
 
         physical_offset = (
             lane_index
@@ -2501,6 +1996,8 @@ def assemble_route_path(classified_line, corridor_index_data):
             * OUTPUT_LANE_SPACING_MM
             / 1000.0
         )
+
+        piece_offsets = [physical_offset] * len(piece_points)
 
         if (
             assembled_points
@@ -2513,12 +2010,9 @@ def assemble_route_path(classified_line, corridor_index_data):
             assembled_offsets.pop()
 
         assembled_points.extend(piece_points)
-        assembled_offsets.extend(
-            [physical_offset] * len(piece_points)
-        )
+        assembled_offsets.extend(piece_offsets)
 
     return assembled_points, assembled_offsets
-
 
 def create_output_layers(project, project_crs):
     # ==================================================
@@ -2557,6 +2051,7 @@ def create_output_layers(project, project_crs):
             QgsField("length_m", QVariant.Double),
             QgsField("corrected_routes", QVariant.String),
             QgsField("canonical_id", QVariant.Int),
+            QgsField("created_by_route", QVariant.Int),
         ]
     )
 
@@ -2608,29 +2103,24 @@ def create_output_layers(project, project_crs):
     )
 
 
-def write_corridor_diagnostics(
-    merged_corridors,
-    corridor_result,
-    corridor_provider,
-    canonical_corridor_by_index,
-    corridor_routes_by_canonical_index
-):
+def write_corridor_diagnostics(graph, corridor_result, corridor_provider):
     # ==================================================
     # SKRIV CORRIDOR-DIAGNOSTIK / WRITE CORRIDOR DIAGNOSTICS
     #
-    # The "CMRL Corridors" layer is a diagnostic view of the topology
-    # itself (smoothed centerlines, route membership) - no lane offsets
-    # are computed here, since lanes are now built once per route
-    # directly from this same topology (materialize_route_layers()).
+    # The "CMRL Corridors" layer is a diagnostic view of the final route
+    # network graph - one row per live edge, no lane offsets computed
+    # here (lanes are built once per route directly from this same
+    # graph, in materialize_route_layers()).
     #
-    # "routes" is this specific candidate's own, possibly-incomplete raw
-    # detection (unchanged, so the raw signal stays inspectable);
-    # "corrected_routes" is what actually gets used for matching and lane
-    # fan-out - the union from resolve_corridor_equivalence() across
-    # every candidate judged to be the same physical stretch. The two
-    # can legitimately differ; that gap is exactly the bug this rewrite
-    # fixed, so surfacing it directly here avoids re-deriving it by hand
-    # from the debug log next time.
+    # One graph edge = one authoritative route-set now, so "routes" and
+    # "corrected_routes" are identical by construction - kept as two
+    # fields for compatibility with any saved QGIS styles/filters that
+    # already reference the old (raw-candidate vs. corrected-union)
+    # schema from before this rewrite. "created_by_route" is genuinely
+    # new information this design provides for free: which route's own
+    # insertion first produced this edge's geometry - useful when
+    # eyeballing "why does this edge's shape look like route 7's noisy
+    # trace".
     # ==================================================
 
     debug("")
@@ -2639,32 +2129,23 @@ def write_corridor_diagnostics(
 
     corridor_features = []
 
-    for corridor_index, corridor in enumerate(merged_corridors):
+    for corridor_id, edge_id in enumerate(sorted(graph["live_edge_ids"]), start=1):
 
-        corridor_id = corridor_index + 1
-        route_numbers = sorted(corridor["routes"])
+        edge = graph["edges"][edge_id]
+        route_numbers = sorted(edge["routes"])
         routes_text = ",".join(str(route_no) for route_no in route_numbers)
-        geometry = corridor["geometry"]
-
-        canonical_index = canonical_corridor_by_index.get(corridor_index, corridor_index)
-        corrected_route_numbers = corridor_routes_by_canonical_index.get(
-            canonical_index,
-            corridor["routes"]
-        )
-        corrected_routes_text = ",".join(
-            str(route_no) for route_no in sorted(corrected_route_numbers)
-        )
 
         corridor_feature = QgsFeature(corridor_result.fields())
 
         corridor_feature["corridor_id"] = corridor_id
         corridor_feature["routes"] = routes_text
         corridor_feature["route_count"] = len(route_numbers)
-        corridor_feature["source_route"] = corridor["source_route"]
-        corridor_feature["length_m"] = geometry.length()
-        corridor_feature["corrected_routes"] = corrected_routes_text
-        corridor_feature["canonical_id"] = canonical_index + 1
-        corridor_feature.setGeometry(geometry)
+        corridor_feature["source_route"] = min(route_numbers)
+        corridor_feature["length_m"] = edge["distances"][-1]
+        corridor_feature["corrected_routes"] = routes_text
+        corridor_feature["canonical_id"] = corridor_id
+        corridor_feature["created_by_route"] = edge["created_by_route"]
+        corridor_feature.setGeometry(QgsGeometry.fromPolylineXY(edge["points"]))
 
         corridor_features.append(corridor_feature)
 
@@ -2673,14 +2154,12 @@ def write_corridor_diagnostics(
 
     debug("Corridor features / Corridor-features:", len(corridor_features))
 
-
-
     return corridor_features
 
 
 def materialize_route_layers(
-    classified_lines,
-    corridor_index_data,
+    graph,
+    resolved_paths,
     routes,
     result,
     provider,
@@ -2688,11 +2167,11 @@ def materialize_route_layers(
     manual_provider
 ):
     # ==================================================
-    # MATERIALISER RUTELAG FRA TOPOLOGI / MATERIALIZE ROUTE LAYERS FROM TOPOLOGY
+    # MATERIALISER RUTELAG FRA GRAF / MATERIALIZE ROUTE LAYERS FROM GRAPH
     #
-    # One continuous path per route, built directly from the topology
-    # (assemble_route_path), tapered at lane_index changes
-    # (smooth_offset_transitions) and offset once
+    # One continuous path per route, built directly from its resolved
+    # graph path (assemble_route_path_from_graph), tapered at lane_index
+    # changes (smooth_offset_transitions) and offset once
     # (offset_polyline_points_varying) - no per-corridor offsetting, no
     # junction snapping, no point-by-point nearest-reference search
     # afterwards. Automatic Lanes and Route Layout are populated from the
@@ -2701,7 +2180,7 @@ def materialize_route_layers(
     # ==================================================
 
     debug("")
-    debug("MATERIALIZING ROUTE LAYERS FROM TOPOLOGY / MATERIALISERER RUTELAG FRA TOPOLOGI")
+    debug("MATERIALIZING ROUTE LAYERS FROM GRAPH / MATERIALISERER RUTELAG FRA GRAF")
     debug("----------------------------------------")
 
     route_name_by_no = {
@@ -2712,27 +2191,20 @@ def materialize_route_layers(
     parts_by_route = {}
     closed_gap_repairs = 0
 
-    for classified_line in classified_lines:
+    for route_no, resolved_path in resolved_paths.items():
 
-        route_no = classified_line["line"]["route_no"]
-
-        points, offsets = assemble_route_path(
-            classified_line,
-            corridor_index_data
+        points, offsets = assemble_route_path_from_graph(
+            graph, route_no, resolved_path
         )
 
         if len(points) < 2:
             continue
 
-        # Corridor-matched stretches already carry smoothed geometry
-        # (smooth_corridor_centerlines), but solo/private stretches are
-        # still each route's own raw recorded points, and the seam where
-        # a route's classified route-set boundary falls slightly before
-        # its physical divergence stabilizes can leave a small kink where
-        # a corridor-matched piece meets a solo piece. One more arc-length
-        # smoothing pass over the fully assembled path - the same
-        # primitive used on corridor centerlines - removes both without
-        # a seam-specific special case.
+        # Fragment boundaries within a route's own path can leave a
+        # small kink where two edges of slightly different smoothing
+        # history meet. One more arc-length smoothing pass over the
+        # fully assembled path - the same primitive used on edge
+        # centerlines - removes it without a seam-specific special case.
         points = moving_average_smooth_points(points, CENTERLINE_SMOOTHING_WINDOW)
 
         distances = cumulative_distances(points)
@@ -2955,7 +2427,7 @@ def add_layers_to_project(project, root, group, corridor_result, result, manual_
 
 
 
-def report_results(corridor_result, corridors, joined_count, manual_result, raw_change_count, result, route_lines, stability_repair_count, stable_change_count):
+def report_results(corridor_result, manual_result, network_stats, result, route_lines):
     # ==================================================
     # FINALIZE / AFSLUT
     # ==================================================
@@ -2970,11 +2442,11 @@ def report_results(corridor_result, corridors, joined_count, manual_result, raw_
     debug("Automatic lane result / Automatisk lane-resultat:", RESULT_NAME)
     debug("Manual production layer / Manuelt produktionslag:", MANUAL_RESULT_NAME)
     debug("Route lines / Rutelinjer:", len(route_lines))
-    debug("Raw route-set transitions / Rå route-set skift:", raw_change_count)
-    debug("Stable route-set transitions / Stabile route-set skift:", stable_change_count)
-    debug("Noise runs repaired / Støj-runs rettet:", stability_repair_count)
-    debug("Raw corridors / Rå korridorer:", len(corridors))
-    debug("Merges / Sammenkædninger:", joined_count)
+    debug("Network nodes / Netværksnoder:", network_stats["node_count"])
+    debug("Network edges / Netværkskanter:", network_stats["edge_count"])
+    debug("Edge splits / Kant-opdelinger:", network_stats["split_count"])
+    debug("Max supersede-chain depth / Maks supersede-kæde-dybde:", network_stats["max_supersede_chain_depth"])
+    debug("Node cluster merges / Node-klynge-sammenlægninger:", network_stats["node_cluster_merges"])
     debug(
         "Final corridors / Endelige korridorer:",
         corridor_result.featureCount()
@@ -2995,11 +2467,12 @@ def report_results(corridor_result, corridors, joined_count, manual_result, raw_
     debug("")
     debug(
         "CMRL Automatic Lanes and CMRL Route Layout are both built directly "
-        "from the corridor topology - one continuous, offset-once feature "
-        "per route, no per-corridor stitching. / CMRL Automatic Lanes og "
-        "CMRL Route Layout er begge bygget direkte fra corridor-topologien "
-        "- én sammenhængende, én-gangs-offsettet feature pr. rute, ingen "
-        "sammensyning mellem corridorer."
+        "from the route network graph - one continuous, offset-once feature "
+        "per route, no per-corridor stitching, no per-point runtime search. "
+        "/ CMRL Automatic Lanes og CMRL Route Layout er begge bygget direkte "
+        "fra rute-netværksgrafen - én sammenhængende, én-gangs-offsettet "
+        "feature pr. rute, ingen sammensyning mellem corridorer, ingen "
+        "runtime-søgning pr. punkt."
     )
     debug(
         "CMRL Route Layout starts identical to Automatic Lanes and is "
@@ -3022,11 +2495,11 @@ class EngineRunResult:
     automatic_lane_layer: object
     manual_lane_layer: object
     route_count: int
-    raw_route_set_changes: int
-    stable_route_set_changes: int
-    stability_repairs: int
-    raw_corridor_count: int
-    joined_corridor_count: int
+    node_count: int
+    edge_count: int
+    split_count: int
+    max_supersede_chain_depth: int
+    node_cluster_merges: int
 
 
 def run_engine(parameters=None, route_layers=None, feedback=None):
@@ -3057,41 +2530,20 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
 
         routes = discover_routes(route_layers or [])
         route_lines = load_routes(routes, project_crs, project)
-        segment_records, fid_to_segment_id, segment_spatial_index = build_segment_index(
-            route_lines, project_crs
-        )
-        classified_lines, raw_change_count, stable_change_count, stability_repair_count = classify_route_sets(
-            route_lines,
-            segment_records,
-            fid_to_segment_id,
-            segment_spatial_index,
-        )
-        corridors = materialize_corridors(classified_lines)
-        merged_corridors, joined_count = merge_corridors(corridors)
-        canonical_corridor_by_index, corridor_routes_by_canonical_index = resolve_corridor_equivalence(
-            merged_corridors
-        )
-        smooth_corridor_centerlines(merged_corridors)
 
-        corridor_index_data = build_corridor_route_index(
-            merged_corridors,
-            canonical_corridor_by_index,
-            corridor_routes_by_canonical_index
-        )
+        graph, resolved_paths, network_stats = build_route_network(route_lines)
 
         corridor_result, corridor_provider, result, provider, manual_result, manual_provider = create_output_layers(
             project, project_crs
         )
         write_corridor_diagnostics(
-            merged_corridors,
+            graph,
             corridor_result,
             corridor_provider,
-            canonical_corridor_by_index,
-            corridor_routes_by_canonical_index,
         )
         lane_features, manual_features = materialize_route_layers(
-            classified_lines,
-            corridor_index_data,
+            graph,
+            resolved_paths,
             routes,
             result,
             provider,
@@ -3109,14 +2561,10 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
         )
         report_results(
             corridor_result,
-            corridors,
-            joined_count,
             manual_result,
-            raw_change_count,
+            network_stats,
             result,
             route_lines,
-            stability_repair_count,
-            stable_change_count,
         )
 
         return EngineRunResult(
@@ -3125,11 +2573,11 @@ def run_engine(parameters=None, route_layers=None, feedback=None):
             automatic_lane_layer=result,
             manual_lane_layer=manual_result,
             route_count=len(route_lines),
-            raw_route_set_changes=raw_change_count,
-            stable_route_set_changes=stable_change_count,
-            stability_repairs=stability_repair_count,
-            raw_corridor_count=len(corridors),
-            joined_corridor_count=joined_count,
+            node_count=network_stats["node_count"],
+            edge_count=network_stats["edge_count"],
+            split_count=network_stats["split_count"],
+            max_supersede_chain_depth=network_stats["max_supersede_chain_depth"],
+            node_cluster_merges=network_stats["node_cluster_merges"],
         )
     finally:
         ENGINE_FEEDBACK = previous_feedback
